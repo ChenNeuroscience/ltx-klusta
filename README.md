@@ -203,7 +203,7 @@ The optional **large_recording** workflow checkbox runs a nine-million-spike
 **feature extraction** memory test on Windows. It is off by default and does
 not run the full clustering search. Routine CI uses small synthetic recordings.
 
-Successful main builds publish [GitHub releases](https://github.com/ChenNeuroscience/prekk/releases)
+Successful main builds publish [GitHub releases](https://github.com/ChenNeuroscience/ltx-klusta/releases)
 tagged with the source commit ID. Each platform has one ZIP plus its checksum.
 Packages include the executable, documentation, example settings, build
 metadata, dependency notices, and file checksums. PR builds provide test
