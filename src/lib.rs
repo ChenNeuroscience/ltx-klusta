@@ -1,10 +1,14 @@
 //! Two-pass feature extraction with memory bounded by block size, not spike count.
 
 #[cfg(not(target_pointer_width = "64"))]
-compile_error!("prekk requires a 64-bit target");
+compile_error!("ltxk requires a 64-bit target");
 
+pub mod cluster;
+pub mod feature_store;
 pub mod linalg;
 mod native;
+pub mod pipeline;
+pub mod queue;
 pub use linalg::Backend;
 use linalg::Engine;
 use nalgebra::DMatrix;
@@ -27,6 +31,7 @@ pub enum Error {
     Io(io::Error),
     Invalid(&'static str),
     Backend(String),
+    Message(String),
     Lapack { routine: &'static str, info: i32 },
 }
 impl fmt::Display for Error {
@@ -35,6 +40,7 @@ impl fmt::Display for Error {
             Self::Io(error) => error.fmt(f),
             Self::Invalid(message) => f.write_str(message),
             Self::Backend(message) => f.write_str(message),
+            Self::Message(message) => f.write_str(message),
             Self::Lapack { routine, info } => write!(f, "LAPACK {routine} failed (INFO={info})"),
         }
     }

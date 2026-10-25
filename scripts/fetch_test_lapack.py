@@ -28,7 +28,7 @@ def fetch(output, env_file):
     provider = providers[0].resolve()
     if env_file:
         with env_file.open("a", encoding="utf-8") as env:
-            env.write(f"PREKK_TEST_LAPACK_LIBRARY={provider}\nPREKK_LAPACK_LIBRARY={provider}\n")
+            env.write(f"LTXK_TEST_LAPACK_LIBRARY={provider}\nLTXK_LAPACK_LIBRARY={provider}\n")
     print(f"CI-only LAPACK provider: {provider}")
 
 

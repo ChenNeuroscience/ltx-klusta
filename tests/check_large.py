@@ -37,7 +37,7 @@ def check(exe, spikes, report, extra_args=()):
     for spike in range(250):
         for channel in range(4):
             bank += struct.pack("<I50b", spike, *(rng.randint(-100, 100) + channel for _ in range(50)))
-    with tempfile.TemporaryDirectory(prefix="prekk scale ") as directory:
+    with tempfile.TemporaryDirectory(prefix="ltxk scale ") as directory:
         root = Path(directory)
         recording = root / "scale.1"
         with recording.open("wb") as output:
@@ -48,7 +48,7 @@ def check(exe, spikes, report, extra_args=()):
                 output.write(block)
             output.write(bank * remainder)
         started = time.monotonic()
-        process = subprocess.Popen([str(exe), str(recording), str(root / "large"), str(root / "count"), "3PC", *extra_args],
+        process = subprocess.Popen([str(exe), "features", str(recording), str(root / "large"), str(root / "count"), "3PC", *extra_args],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         peak = 0
         while process.poll() is None:

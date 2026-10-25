@@ -10,8 +10,11 @@ import tomllib
 
 def package(exe, output, platform):
     output.mkdir(parents=True)
-    shutil.copy2(exe, output / ("prekk.exe" if platform == "windows" else "prekk"))
+    shutil.copy2(exe, output / ("ltxk.exe" if platform == "windows" else "ltxk"))
     shutil.copy2("README.md", output / "README.md")
+    shutil.copy2("ltxk.example.json", output / "ltxk.example.json")
+    shutil.copy2("CLUSTERING.md", output / "CLUSTERING.md")
+    shutil.copy2("PERFORMANCE.md", output / "PERFORMANCE.md")
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     compiler = subprocess.check_output(["rustc", "-vV"], text=True)
     (output / "BUILD.txt").write_text(

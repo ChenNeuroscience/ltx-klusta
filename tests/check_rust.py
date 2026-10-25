@@ -28,15 +28,15 @@ def check(exe, extra_args=()):
         require(result.returncode == 0 and result.stdout, f"CLI {flag} failed: {result.stderr}")
     for shell in ("bash", "zsh", "fish", "powershell", "elvish"):
         result = command(exe, "--completions", shell)
-        require(result.returncode == 0 and "prekk" in result.stdout, result.stderr)
+        require(result.returncode == 0 and "ltxk" in result.stdout, result.stderr)
     require(command(exe).returncode == 2, "Missing arguments should be a CLI error")
-    positional = ["x.1", "out", "count", "3PC"]
+    positional = ["features", "x.1", "out", "count", "3PC"]
     for flags in (("--backend", "typo"), ("--block-spikes", "0"),
                   ("--block-spikes", "65537"), ("--block-spikes", "oops"), ("--blok-spikes", "7"),
                   ("--backend", "nalgebra", "--lapack-library", "x.dll")):
         result = command(exe, *positional, *flags)
         require(result.returncode == 2 and "error:" in result.stderr, "CLI validation failed")
-    with tempfile.TemporaryDirectory(prefix="prekk rust ") as directory:
+    with tempfile.TemporaryDirectory(prefix="ltxk rust ") as directory:
         root = Path(directory)
         tetrode = root / "data.1"
         rank_one = [[(i - 20) * ((j % 5) - 2) + 4 for j in range(50)] for i in range(41)]
@@ -68,7 +68,7 @@ def check(exe, extra_args=()):
                     require(all(row[pcs:] == [max(wave)-min(wave), wave[at]]
                                 for wave, row in zip(waves, rows)), "A/VT values are incorrect")
             require(outputs[0] == outputs[1] == outputs[2], "Chunk size changed output")
-            result = command(exe, tetrode, root / "output", tetrode, components, *extra_args)
+            result = command(exe, "features", tetrode, root / "output", tetrode, components, *extra_args)
             require(result.returncode != 0 and tetrode.read_bytes() == original, "Input overwritten by count output")
             unicode_root = root / "unicode λ"
             unicode_root.mkdir(exist_ok=True)
@@ -78,7 +78,7 @@ def check(exe, extra_args=()):
                     "Unicode paths changed extraction")
             alias = root / "alias.fet.1"
             alias.write_bytes(original)
-            result = command(exe, alias, root / "alias", root / "count", components, *extra_args)
+            result = command(exe, "features", alias, root / "alias", root / "count", components, *extra_args)
             require(result.returncode != 0 and alias.read_bytes() == original, "Input overwritten by features")
     print("CLI, chunk boundaries, analytic PCA, Unicode paths, and output safety passed")
 

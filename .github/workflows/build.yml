@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       large_recording:
-        description: Run the full 9-million-spike Windows memory and output test
+        description: Run the 9-million-spike Windows feature-extraction memory test
         type: boolean
         default: false
 
@@ -24,7 +24,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
-      PREKK_REQUIRE_LAPACK: '1'
+      LTXK_REQUIRE_LAPACK: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -32,11 +32,11 @@ jobs:
           - os: windows-2022
             platform: windows-x64
             package_platform: windows
-            executable: target/release/prekk.exe
+            executable: target/release/ltxk.exe
           - os: macos-15
             platform: macos-arm64
             package_platform: macos
-            executable: target/release/prekk
+            executable: target/release/ltxk
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -58,9 +58,9 @@ jobs:
         run: cargo build --release --locked
       - name: Package one executable without numerical DLLs
         run: |
-          python scripts/package_rust.py --exe ${{ matrix.executable }} --output dist/prekk-${{ matrix.platform }} --platform ${{ matrix.package_platform }}
-      - name: Test standalone package and optional runtime LAPACK
-        run: python tests/check_package.py --package dist/prekk-${{ matrix.platform }}
+          python scripts/package_rust.py --exe ${{ matrix.executable }} --output dist/ltxk-${{ matrix.platform }} --platform ${{ matrix.package_platform }}
+      - name: Test features, clustering, queue recovery, and optional runtime LAPACK
+        run: python tests/check_package.py --package dist/ltxk-${{ matrix.platform }}
       - name: Optional 9-million-spike Windows test
         if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
         run: |
@@ -69,8 +69,8 @@ jobs:
           cat large-nalgebra.json large-lapack.json >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
-          name: prekk-${{ matrix.platform }}
-          path: dist/prekk-${{ matrix.platform }}/
+          name: ltxk-${{ matrix.platform }}
+          path: dist/ltxk-${{ matrix.platform }}/
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
@@ -86,7 +86,7 @@ jobs:
     permissions:
       contents: write
     concurrency:
-      group: prekk-release-${{ github.sha }}
+      group: ltxk-release-${{ github.sha }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
@@ -94,7 +94,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
-          pattern: prekk-*
+          pattern: ltxk-*
           path: artifacts
       - name: Package releases and select commit tag
         id: package
@@ -107,14 +107,14 @@ jobs:
 
           output = Path('release')
           output.mkdir()
-          packages = sorted(Path('artifacts').glob('prekk-*'))
+          packages = sorted(Path('artifacts').glob('ltxk-*'))
           if len(packages) != 2:
               raise RuntimeError('Expected one Windows and one macOS package')
           for package in packages:
               archive = output / (package.name + '.zip')
               with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
                   for item in sorted(package.iterdir()):
-                      if package.name.startswith('prekk-macos-') and item.name == 'prekk':
+                      if package.name.startswith('ltxk-macos-') and item.name == 'ltxk':
                           item.chmod(0o755)
                       bundle.write(item, item.name)
               digest = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -125,8 +125,8 @@ jobs:
         with:
           tag: ${{ steps.package.outputs.tag }}
           commit: ${{ github.sha }}
-          name: prekk ${{ steps.package.outputs.tag }}
-          body: Built and tested from commit ${{ github.sha }}. Each platform has one executable, using nalgebra by default and optional LAPACK loaded at runtime. No numerical DLLs are bundled or required to start.
+          name: ltxk ${{ steps.package.outputs.tag }}
+          body: Built and tested from commit ${{ github.sha }}. Combined LTX feature extraction, classic KlustaKwik clustering, and a persistent job queue in one executable per platform. Pure Rust by default, with optional runtime LAPACK for PCA. No numerical DLLs are bundled. See CLUSTERING.md for algorithm scope and validation.
           artifacts: release/*.zip,release/*.sha256
           artifactErrorsFailBuild: true
           allowUpdates: true
