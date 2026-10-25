@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -133,23 +134,62 @@ def check_queue(exe):
             if job["phase"] == "done":
                 require(job["output"]["fitting_spikes"] == 250 and job["output"]["stride"] == 48, "Subset policy changed")
         require(not list((queue / "work").iterdir()), "Completed queue work directories leaked")
-        # Kill a real coordinator with an active worker, then recover its job.
-        process = subprocess.Popen([str(exe), "enqueue", str(paths[0]), "--force", *flags],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
-        deadline = time.monotonic() + 15
-        while True:
-            records = json.loads(command(exe, "status", "--json", "--queue-dir", queue).stdout)
-            if any(job["phase"] == "running" for job in records):
-                process.kill()
-                process.communicate(timeout=5)
-                break
-            require(process.poll() is None and time.monotonic() < deadline, "Could not observe the interrupted job")
-            time.sleep(0.005)
+        # Hold the same OS lock as a coordinator, stage an interrupted-running
+        # record, then kill the lock holder. This tests crash lock release and
+        # recovery without racing against a small job finishing on a fast CPU.
+        holder = subprocess.Popen([sys.executable, "-u", "-c", """
+import os, sys
+lock = open(sys.argv[1], 'a+b')
+if os.name == 'nt':
+    import msvcrt
+    lock.seek(0)
+    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+else:
+    import fcntl
+    fcntl.flock(lock, fcntl.LOCK_EX)
+print('locked', flush=True)
+sys.stdin.read()
+""", str(queue / "coordinator.lock")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        try:
+            require(holder.stdout.readline().strip() == "locked", "Could not acquire coordinator test lock")
+            submitted = command(exe, "enqueue", paths[0], "--force", *flags)
+            require(submitted.returncode == 0 and "existing coordinator" in submitted.stderr, submitted.stderr)
+            job_id = submitted.stdout.splitlines()[0].split()[1]
+            pending = queue / "pending" / (job_id + ".json")
+            job = json.loads(pending.read_text())
+            job["phase"] = "running"
+            (queue / "running" / pending.name).write_text(json.dumps(job), encoding="utf-8")
+            pending.unlink()
+            scratch = queue / "work" / job_id
+            scratch.mkdir()
+            (scratch / "interrupted.bin").write_bytes(b"interrupted scratch file")
+        finally:
+            holder.kill()
+            holder.communicate(timeout=5)
         result = command(exe, "resume", "--queue-dir", queue, "--jobs", "2")
         require(result.returncode == 0 and "Recovered interrupted job" in result.stderr, result.stderr)
         records = json.loads(command(exe, "status", "--json", "--queue-dir", queue).stdout)
         require(all(job["phase"] in ("done", "failed") for job in records), "Interrupted job was not recovered")
         require(not list((queue / "work").iterdir()), "Interrupted scratch directory was not cleaned")
+        # Explorer's detached invocation must actually launch a coordinator,
+        # including when the packaged executable is outside the working dir.
+        directory = root / "background ! λ"
+        directory.mkdir()
+        background = directory / "same name.1"
+        background.write_bytes(paths[0].read_bytes())
+        result = command(exe, "enqueue", background, "--background", *flags)
+        require(result.returncode == 0, result.stderr)
+        job_id = result.stdout.splitlines()[0].split()[1]
+        deadline = time.monotonic() + 60
+        while True:
+            records = json.loads(command(exe, "status", "--json", "--queue-dir", queue).stdout)
+            job = next(job for job in records if job["id"] == job_id)
+            require(job["phase"] != "failed", f"Background job failed: {job['error']}")
+            if job["phase"] == "done": break
+            require(time.monotonic() < deadline, "Detached coordinator did not finish")
+            time.sleep(0.02)
+        check_labels(background.with_suffix(".clu.1"), 12000, check_populations=False)
     print("Cross-process queue, bounded concurrency, failure continuation, colliding names, and crash recovery passed")
 
 
