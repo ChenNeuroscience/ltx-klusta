@@ -1,45 +1,110 @@
-name: Build Windows x64
+name: Build Rust
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      large_recording:
+        description: Run the full 9-million-spike Windows memory and output test
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
-    runs-on: windows-2022
+    name: ${{ matrix.platform }} / ${{ matrix.backend }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x64
+            package_platform: windows
+            backend: nalgebra
+            cargo_args: ''
+            executable: target/release/prekk.exe
+            baseline: build-legacy/Release/prekk.exe
+          - os: windows-2022
+            platform: windows-x64
+            package_platform: windows
+            backend: lapack
+            cargo_args: --features lapack
+            executable: target/release/prekk.exe
+            baseline: build-legacy/Release/prekk.exe
+          - os: macos-15
+            platform: macos-arm64
+            package_platform: macos
+            backend: nalgebra
+            cargo_args: ''
+            executable: target/release/prekk
+            baseline: build-legacy/prekk
+          - os: macos-15
+            platform: macos-arm64
+            package_platform: macos
+            backend: lapack
+            cargo_args: --features lapack
+            executable: target/release/prekk
+            baseline: build-legacy/prekk
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      - name: Configure x64
-        run: cmake -S . -B build -A x64 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
-      - name: Build
-        run: cmake --build build --config Release --parallel
-      - name: Verify x64 executable and feature extraction
+      - name: Set up stable Rust and check tools
         run: |
-          python -c "import pathlib,struct; p=pathlib.Path('build/Release/prekk.exe').read_bytes(); o=struct.unpack_from('<I',p,0x3c)[0]; assert struct.unpack_from('<H',p,o+4)[0] == 0x8664, 'Expected x64 PE executable'"
-          ctest --test-dir build -C Release --output-on-failure
-      - name: Package executable with matching x64 libraries
-        shell: pwsh
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Format, lint, and unit tests
         run: |
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item build/Release/prekk.exe, build/Release/blas_win64_MT.dll, build/Release/lapack_win64_MT.dll, README.md -Destination dist
-          Get-ChildItem dist -File -Exclude SHA256SUMS.txt | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content dist/SHA256SUMS.txt
+          cargo fmt --check
+          cargo clippy --all-targets --locked ${{ matrix.cargo_args }} -- -D warnings
+          cargo test --locked ${{ matrix.cargo_args }}
+      - name: Build Rust release
+        run: cargo build --release --locked ${{ matrix.cargo_args }}
+      - name: Configure C++ numerical reference (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build-legacy -A x64
+      - name: Configure C++ numerical reference (macOS)
+        if: runner.os == 'macOS'
+        run: cmake -S . -B build-legacy -DCMAKE_BUILD_TYPE=Release
+      - name: Build C++ reference
+        run: cmake --build build-legacy --config Release --parallel
+      - name: Package executable and required libraries
+        run: |
+          python scripts/package_rust.py --exe ${{ matrix.executable }} --output dist/prekk-rust-${{ matrix.platform }}-${{ matrix.backend }} --platform ${{ matrix.package_platform }} --backend ${{ matrix.backend }}
+      - name: Test standalone package against C++
+        run: |
+          python tests/check_package.py --package dist/prekk-rust-${{ matrix.platform }}-${{ matrix.backend }} --backend ${{ matrix.backend }} --baseline ${{ matrix.baseline }}
+      - name: Test all 9 million spikes with less than 256 MiB RAM
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
+        run: |
+          python tests/check_large.py --exe dist/prekk-rust-${{ matrix.platform }}-${{ matrix.backend }}/prekk.exe --baseline ${{ matrix.baseline }} --report large-recording.json
+          cat large-recording.json >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
-          name: prekk-windows-x64
-          path: dist/
+          name: prekk-rust-${{ matrix.platform }}-${{ matrix.backend }}
+          path: dist/prekk-rust-${{ matrix.platform }}-${{ matrix.backend }}/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
+        with:
+          name: benchmark-${{ matrix.platform }}-${{ matrix.backend }}
+          path: large-recording.json
           if-no-files-found: error
 
   release:
     needs: build
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -52,11 +117,10 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
-          name: prekk-windows-x64
-          path: dist
-      - name: Package release and select commit tag
+          pattern: prekk-rust-*
+          path: artifacts
+      - name: Package releases and select commit tag
         id: package
-        shell: bash
         run: |
           echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           python3 - <<'PY'
@@ -66,21 +130,25 @@ jobs:
 
           output = Path('release')
           output.mkdir()
-          archive = output / 'prekk-windows-x64.zip'
-          with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
-              for item in sorted(Path('dist').iterdir()):
-                  bundle.write(item, item.name)
-          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-          archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')
+          packages = sorted(Path('artifacts').glob('prekk-rust-*'))
+          if len(packages) != 4:
+              raise RuntimeError('Expected both backends for Windows and macOS')
+          for package in packages:
+              archive = output / (package.name + '.zip')
+              with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
+                  for item in sorted(package.iterdir()):
+                      bundle.write(item, item.name)
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')
           PY
       - name: Publish GitHub release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ steps.package.outputs.tag }}
           commit: ${{ github.sha }}
-          name: Windows x64 ${{ steps.package.outputs.tag }}
-          body: Windows x64 prekk built and tested from commit ${{ github.sha }}. Extract the ZIP and keep prekk.exe and both DLLs together.
-          artifacts: release/prekk-windows-x64.zip,release/prekk-windows-x64.zip.sha256
+          name: Rust prekk ${{ steps.package.outputs.tag }}
+          body: Rust prekk built and tested from commit ${{ github.sha }}. Choose the nalgebra package for no external numerical libraries, or the LAPACK package for BLAS/LAPACK. Windows LAPACK packages include both required DLLs. macOS packages target Apple Silicon.
+          artifacts: release/*.zip,release/*.sha256
           artifactErrorsFailBuild: true
           allowUpdates: true
           makeLatest: true

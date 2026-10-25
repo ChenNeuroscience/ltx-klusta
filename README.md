@@ -1,5 +1,9 @@
 # prekk
 
+The experimental Rust rewrite is documented in [RUST.md](RUST.md), including
+the CLI, optional LAPACK backend, streaming design, and native Windows/macOS CI.
+The notes below describe the retained C++ reference and its previous release.
+
 Extract KlustaKwik features from Axona tetrode files: principal components,
 amplitude (`A`), and voltage at the sample with maximum variance (`VT`).
 Input records contain four channels, each with a 4-byte timestamp and 50 signed
