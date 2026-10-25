@@ -1,3 +1,4 @@
+use crate::progress::{Stage, Update};
 use crate::{
     cluster, feature_store::FeatureStore, Backend, Error, Features, Result, DEFAULT_BLOCK_SPIKES,
     MAX_BLOCK_SPIKES,
@@ -120,6 +121,16 @@ pub fn cluster_in(
     work: &Path,
     log: &mut dyn Write,
 ) -> Result<Output> {
+    cluster_in_observed(input, settings, work, log, &mut |_| Ok(()))
+}
+
+pub(crate) fn cluster_in_observed(
+    input: &Path,
+    settings: &Settings,
+    work: &Path,
+    log: &mut dyn Write,
+    notify: &mut dyn FnMut(Update) -> Result<()>,
+) -> Result<Output> {
     settings.validate()?;
     let input = fs::canonicalize(input)?;
     let output = output_path(&input)?;
@@ -137,17 +148,24 @@ pub fn cluster_in(
         });
     }
     writeln!(log, "Clustering {}", input.display())?;
+    writeln!(log, "Extracting {} features...", settings.features)?;
+    notify(Update::Stage(Stage::Extracting))?;
     let started = Instant::now();
-    let features = crate::extract(&crate::Options {
-        input: input.clone(),
-        output_base: work.join("recording"),
-        info: work.join("count"),
-        features: Features::parse(&settings.features)?,
-        backend: settings.backend,
-        lapack_library: settings.lapack_library.clone(),
-        block_spikes: settings.block_spikes,
-    })?;
+    let features = crate::extract_logged(
+        &crate::Options {
+            input: input.clone(),
+            output_base: work.join("recording"),
+            info: work.join("count"),
+            features: Features::parse(&settings.features)?,
+            backend: settings.backend,
+            lapack_library: settings.lapack_library.clone(),
+            block_spikes: settings.block_spikes,
+        },
+        log,
+    )?;
     let extracted = Instant::now();
+    writeln!(log, "Preparing clustering features...")?;
+    notify(Update::Stage(Stage::Features))?;
     let store = FeatureStore::create(&features, &work.join("features.bin"))?;
     if std::env::var_os("LTXK_PROFILE").is_some() {
         writeln!(
@@ -158,7 +176,12 @@ pub fn cluster_in(
         )?;
     }
     fs::remove_file(features)?;
-    let result = cluster::run(&store, &settings.cluster, work, log)?;
+    let result = cluster::run_observed(&store, &settings.cluster, work, log, notify)?;
+    notify(Update::TrialDone {
+        clusters: result.counts.iter().skip(1).filter(|&&n| n > 0).count(),
+        noise: result.counts[0],
+    })?;
+    notify(Update::Stage(Stage::Publishing))?;
     let mut mapping = [1_u8; cluster::MAX_CLUSTERS];
     let mut labels = 1;
     for (c, &count) in result.counts.iter().enumerate().skip(1) {

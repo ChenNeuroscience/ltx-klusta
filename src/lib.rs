@@ -4,11 +4,14 @@
 compile_error!("ltxk requires a 64-bit target");
 
 pub mod cluster;
+mod dashboard;
 pub mod feature_store;
 pub mod linalg;
 mod native;
 pub mod pipeline;
+pub mod progress;
 pub mod queue;
+mod queue_progress;
 pub use linalg::Backend;
 use linalg::Engine;
 use nalgebra::DMatrix;
@@ -310,6 +313,10 @@ fn build_models(
 }
 
 pub fn extract(options: &Options) -> Result<PathBuf> {
+    extract_logged(options, &mut io::stderr())
+}
+
+pub(crate) fn extract_logged(options: &Options, log: &mut dyn Write) -> Result<PathBuf> {
     if !(1..=MAX_BLOCK_SPIKES).contains(&options.block_spikes) {
         return Err(Error::Invalid("block-spikes must be between 1 and 65536"));
     }
@@ -337,12 +344,13 @@ pub fn extract(options: &Options) -> Result<PathBuf> {
         ));
     }
     let engine = Engine::resolve(options.backend, options.lapack_library.as_deref())?;
-    eprintln!(
+    writeln!(
+        log,
         "{} spikes; {} backend; blocks of {} spikes",
         header.spikes,
         engine.description(),
         options.block_spikes
-    );
+    )?;
     let mut raw = vec![0; options.block_spikes * BYTES_PER_SPIKE];
     let models = build_models(&mut reader, &header, options, &engine, &mut raw)?;
     reader.seek(SeekFrom::Start(header.offset))?;

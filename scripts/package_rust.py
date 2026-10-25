@@ -15,6 +15,10 @@ def package(exe, output, platform):
     shutil.copy2("ltxk.example.json", output / "ltxk.example.json")
     shutil.copy2("CLUSTERING.md", output / "CLUSTERING.md")
     shutil.copy2("PERFORMANCE.md", output / "PERFORMANCE.md")
+    if platform == "windows":
+        for name in ("runkk.bat", "open-logs.bat"):
+            # cmd.exe launchers use Windows line endings in every package.
+            (output / name).write_bytes(Path("scripts/windows", name).read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     compiler = subprocess.check_output(["rustc", "-vV"], text=True)
     (output / "BUILD.txt").write_text(

@@ -2,6 +2,7 @@
 //! BIC deletion, recursive split proposals, and the ltxk subset policy.
 //! Algorithm reference: klusta-team/klustakwik at 9ca1d21 (June 2014).
 use crate::feature_store::{Data, FeatureStore};
+use crate::progress::{Stage, Update};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -398,6 +399,17 @@ impl State {
         recurse: bool,
         noise: bool,
     ) -> Result<f64> {
+        self.cem_observed(options, random, recurse, noise, None)
+    }
+
+    fn cem_observed(
+        &mut self,
+        options: &Options,
+        random: &mut Random,
+        recurse: bool,
+        noise: bool,
+        mut report: Option<&mut dyn FnMut(usize, usize, bool) -> Result<()>>,
+    ) -> Result<f64> {
         let mut score = f64::INFINITY;
         let mut full = true;
         let mut previous = vec![0; self.class.len()];
@@ -426,7 +438,33 @@ impl State {
             let split_due = iteration == 20
                 || (iteration > 20 && (iteration - 20) % 40 == 39)
                 || (changed == 0 && last_full);
-            let split = recurse && split_due && self.try_splits(options, random)?;
+            if let Some(report) = report.as_mut() {
+                report(
+                    iteration,
+                    self.alive.iter().skip(1).filter(|&&v| v).count(),
+                    false,
+                )?;
+            }
+            let split = if recurse && split_due {
+                if let Some(report) = report.as_mut() {
+                    report(
+                        iteration,
+                        self.alive.iter().skip(1).filter(|&&v| v).count(),
+                        true,
+                    )?;
+                }
+                let split = self.try_splits(options, random)?;
+                if let Some(report) = report.as_mut() {
+                    report(
+                        iteration,
+                        self.alive.iter().skip(1).filter(|&&v| v).count(),
+                        false,
+                    )?;
+                }
+                split
+            } else {
+                false
+            };
             if changed == 0 && last_full && !split {
                 return Ok(score);
             }
@@ -520,8 +558,22 @@ pub fn run(
     work: &Path,
     log: &mut dyn Write,
 ) -> Result<Output> {
+    run_observed(store, options, work, log, &mut |_| Ok(()))
+}
+
+pub(crate) fn run_observed(
+    store: &FeatureStore,
+    options: &Options,
+    work: &Path,
+    log: &mut dyn Write,
+    notify: &mut dyn FnMut(Update) -> Result<()>,
+) -> Result<Output> {
     options.validate()?;
     let (stride, fitting_spikes) = sampling_plan(store.points, options.target_spikes);
+    notify(Update::Dataset {
+        spikes: store.points,
+        fitting_spikes,
+    })?;
     writeln!(
         log,
         "{} spikes, {} active features; fitting {fitting_spikes} (stride {stride})",
@@ -533,6 +585,11 @@ pub fn run(
     let mut root = vec![0.; store.dims()];
     let profile = std::env::var_os("LTXK_PROFILE").is_some();
     for starting in options.min_clusters..=options.max_clusters {
+        notify(Update::Trial {
+            current: starting - options.min_clusters + 1,
+            total: options.max_clusters - options.min_clusters + 1,
+            initial: starting,
+        })?;
         let started = Instant::now();
         let indices: Vec<_> = (0..fitting_spikes)
             .map(|i| {
@@ -546,6 +603,7 @@ pub fn run(
         let data = Arc::new(store.load_indices(&indices)?);
         let loaded = Instant::now();
         let mut state = State::new(data);
+        notify(Update::Stage(Stage::Fitting))?;
         let fitted_score = if store.dims() == 0 {
             state.alive[0] = true;
             state.weight[0] = 1.;
@@ -553,7 +611,14 @@ pub fn run(
             0.
         } else {
             state.initialize(starting, &mut random);
-            state.cem(options, &mut random, true, true)?
+            let mut report = |iteration, clusters, splitting| {
+                notify(Update::Iteration {
+                    iteration,
+                    clusters,
+                    splitting,
+                })
+            };
+            state.cem_observed(options, &mut random, true, true, Some(&mut report))?
         };
         let fitted = Instant::now();
         let model = state.model();
@@ -561,6 +626,7 @@ pub fn run(
         let mut labels = BufWriter::with_capacity(1 << 20, File::create(&candidate)?);
         let mut counts = [0; MAX_CLUSTERS];
         let mut score = fitted_score;
+        notify(Update::Stage(Stage::Assigning))?;
         if stride == 1 {
             for &class in &state.class {
                 labels.write_all(&[class as u8])?;
@@ -568,15 +634,23 @@ pub fn run(
             }
         } else {
             score = penalty(store.points, store.dims(), state.ids().len());
+            let mut assigned = 0_usize;
             store.for_each(|row| {
                 let (class, value) = model.best(row, &mut root);
                 counts[class] += 1;
                 score += value;
                 labels.write_all(&[class as u8])?;
+                assigned += 1;
+                if assigned.is_multiple_of(4096) {
+                    notify(Update::Assigned { count: assigned })?;
+                }
                 Ok(())
             })?;
         }
         labels.flush()?;
+        notify(Update::Assigned {
+            count: store.points,
+        })?;
         drop(labels);
         if profile {
             writeln!(
@@ -591,6 +665,10 @@ pub fn run(
             return Err(Error::Invalid("Clustering produced a non-finite score"));
         }
         let clusters = counts.iter().skip(1).filter(|&&n| n > 0).count();
+        notify(Update::TrialDone {
+            clusters,
+            noise: counts[0],
+        })?;
         writeln!(
             log,
             "Start {starting}: {clusters} signal clusters, {} noise spikes, full score {score:.8}",

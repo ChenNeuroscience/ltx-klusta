@@ -46,13 +46,34 @@ Use the persistent per-user queue when jobs arrive through separate Explorer
 invocations:
 
 ```sh
-ltxk enqueue recording.1 recording.2 --background
+ltxk enqueue recording.1 recording.2 --console
 ltxk status
 ltxk status --json
-ltxk resume
+ltxk resume --console
 ```
 
-`enqueue` without `--background` participates in the queue in the foreground.
+`--console` opens a live terminal dashboard, with queue totals and one row per
+recording. Rows show the processing stage, current trial, iteration, signal
+cluster count, and elapsed time. Select a row with the arrow keys to see its
+full path and local start time. Elapsed time starts when a worker picks up the
+file, resets if an interrupted job is retried, and freezes when it finishes.
+Press **L** to open the selected file's log in a text editor, or **O** to open
+the logs folder. Trial/iteration counts describe the current fit; they do not
+predict completion time. The dashboard remains open until **Enter** or **Q**
+after processing finishes, including when a recording fails.
+
+There is one active console per queue. Subsequent submissions join that queue
+and return immediately; progress appears in the existing console. A console
+can also follow an already running background coordinator. When processing
+finishes, new submissions can start a fresh console while the old summary
+stays open. Closing an active window or pressing **Ctrl+C** interrupts its
+workers; the next launch recovers unfinished jobs. Closing a console that is
+following a separate background coordinator leaves that coordinator running.
+
+Without an interactive terminal, `--console` prints plain progress and job
+logs and exits on completion. `enqueue` without `--console` or `--background`
+participates in the queue with plain foreground output. Use `--background`
+explicitly when detached processing is wanted.
 One coordinator processes at most four jobs at once by default, even when
 several processes submit recordings. Its `--jobs` value sets the active limit.
 Duplicate pending/running recordings share one job. Completed jobs can be
@@ -67,6 +88,57 @@ Queue history and logs remain available through `status`.
 The default queue is `%LOCALAPPDATA%\ltxk\queue` on Windows and
 `~/Library/Application Support/ltxk/queue` on macOS. `--queue-dir PATH`
 overrides it on `enqueue`, `status`, and `resume`.
+
+## Replace the old fancykk launcher on Windows
+
+Download the Windows ZIP from [Releases](https://github.com/ChenNeuroscience/ltx-klusta/releases)
+and extract it. It includes `ltxk.exe`, `runkk.bat`, and `open-logs.bat`.
+
+1. Replace the old `runkk.bat` with the supplied file and put `ltxk.exe` in the
+   same folder. The new batch file replaces the whole old script, including
+   its calls to prekk and KlustaKwik and its temporary-file/queue management.
+2. If your existing context-menu entry points to that batch-file path, keep
+   using it. Remove any custom shortcut's minimized launch setting to keep
+   the console visible. No new context-menu installation is needed.
+3. Drop recordings onto **runkk.bat**, or select the existing right-click
+   action. A visible console processes the shared queue. Double-click
+   **runkk.bat** without files to reopen/resume it. **open-logs.bat** opens the
+   default queue's log folder independently of the console.
+
+Move any customized batch settings into `ltxk.json` beside the executable
+(see the example below):
+
+| Old batch setting | New JSON setting |
+| --- | --- |
+| `prekk_flags` (e.g. `3PC`) | `features` |
+| Initial cluster range | `cluster.min_clusters`, `cluster.max_clusters` |
+| Target fitting spikes | `cluster.target_spikes` |
+| Concurrent processes | `jobs` |
+
+The defaults already match the original fancykk workflow. Old KlustaKwik
+command-line arguments are not accepted by `ltxk`; use the documented settings.
+Dropping files directly onto `ltxk.exe` also works, but each such invocation
+runs independently. Use the batch launcher for the shared queue/dashboard.
+
+A custom registry command can call the executable directly:
+`"C:\path\to\ltxk.exe" enqueue --console "%1"`.
+The portable launcher uses the existing classic Windows menu.
+
+## Preview the launcher on macOS
+
+From a source checkout, build the binary and create a local Finder droplet:
+
+```sh
+cargo build --release --locked
+python3 scripts/create_macos_preview.py --exe target/release/ltxk --output "../ltx-klusta Preview.app"
+```
+
+Drop numeric recording files onto the app, or double-click it to choose files
+or reopen the queue. It opens the same dashboard in Terminal, without adding
+a Finder menu. macOS may ask to allow the app to control Terminal on first use.
+The app refers to the binary's absolute path, so rebuilding that binary updates
+the preview; moving it requires creating a new app. Choose a new output path
+when regenerating the app. Existing `.clu.N` outputs are skipped.
 
 ## Configuration
 
@@ -166,7 +238,7 @@ independent. See [Microsoft's integration guide](https://learn.microsoft.com/en-
 This branch provides the safe multi-file queue command that an extension can
 invoke, but does not yet install a modern Explorer extension. Such an extension
 should filter numeric recording extensions, enumerate the selection, and call
-`ltxk enqueue --background` with individual paths, without a command shell.
+`ltxk enqueue --console` with individual paths and a visible console, without a command shell.
 It must keep menu construction fast and leave processing to the queue.
 GitHub's Windows runner can test its COM and package behaviour, but visual menu
 placement still needs a Windows 11 desktop check.
@@ -184,6 +256,7 @@ cargo clippy --all-targets --locked -- -D warnings
 python3 tests/check_features.py --exe target/release/ltxk
 python3 tests/check_rust.py --exe target/release/ltxk
 python3 tests/check_cluster.py --exe target/release/ltxk
+python3 tests/check_console.py --exe target/release/ltxk
 ```
 
 Use a current stable Rust toolchain. Windows executables have the `.exe` suffix
