@@ -90,9 +90,11 @@ impl std::fmt::Display for Backend {
 fn lapack_eigen(mut matrix: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
     let n = SAMPLES as i32;
     let mut values = vec![0.0; SAMPLES];
-    // DSYEVD with JOBZ=V: LWORK >= 1+6*N+2*N*N and LIWORK >= 3+5*N.
-    let mut work = vec![0.0; 1 + 6 * SAMPLES + 2 * SAMPLES * SAMPLES];
-    let mut iwork = vec![0; 3 + 5 * SAMPLES];
+    // Match the working C++ reference: use the upper triangle and its
+    // conservative workspace sizes, rather than the documented minima.
+    // This also keeps the older bundled Windows LAPACK on the same code path.
+    let mut work = vec![0.0; 2 * (1 + 6 * SAMPLES + 2 * SAMPLES * SAMPLES)];
+    let mut iwork = vec![0; 3 * (3 + 5 * SAMPLES)];
     let (lwork, liwork) = (work.len() as i32, iwork.len() as i32);
     let mut info = 0;
     // SAFETY: the 50x50 matrix, eigenvalues, and documented workspaces above
@@ -100,7 +102,7 @@ fn lapack_eigen(mut matrix: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
     unsafe {
         lapack::dsyevd(
             b'V',
-            b'L',
+            b'U',
             n,
             matrix.as_mut_slice(),
             n,
@@ -116,4 +118,76 @@ fn lapack_eigen(mut matrix: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
         return Err(Error::Lapack(info));
     }
     Ok((values, matrix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backends() -> Vec<Backend> {
+        let mut values = vec![Backend::Nalgebra];
+        if let Ok(lapack) = Backend::parse("lapack") {
+            values.push(lapack);
+        }
+        values
+    }
+
+    #[test]
+    fn accumulated_integer_products_match_direct_sums() {
+        let count = 7;
+        let data: Vec<_> = (0..count * SAMPLES)
+            .map(|i| ((i * 31 % 199) as i32 - 99) as f64)
+            .collect();
+        for backend in backends() {
+            let mut actual = DMatrix::zeros(SAMPLES, SAMPLES);
+            backend.accumulate(&data, count, &mut actual);
+            backend.accumulate(&data, count, &mut actual);
+            for column in 0..SAMPLES {
+                for row in column..SAMPLES {
+                    let expected = 2.0
+                        * (0..count)
+                            .map(|i| data[i * SAMPLES + row] * data[i * SAMPLES + column])
+                            .sum::<f64>();
+                    assert_eq!(
+                        actual[(row, column)],
+                        expected,
+                        "{} at ({row}, {column})",
+                        backend.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eigenvectors_are_orthonormal_and_reconstruct_a_dense_matrix() {
+        let mut state = 943_u64;
+        let data: Vec<_> = (0..80 * SAMPLES)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 56) as i8 as f64
+            })
+            .collect();
+        let mut lower = DMatrix::zeros(SAMPLES, SAMPLES);
+        Backend::Nalgebra.accumulate(&data, 80, &mut lower);
+        let matrix = DMatrix::from_fn(SAMPLES, SAMPLES, |row, column| {
+            lower[(row.max(column), row.min(column))]
+        });
+        for backend in backends() {
+            let (values, vectors) = backend.eigen(matrix.clone()).unwrap();
+            let residual = &matrix * &vectors
+                - &vectors * DMatrix::from_diagonal(&nalgebra::DVector::from_vec(values));
+            assert!(
+                residual.norm() / matrix.norm() < 1e-12,
+                "{} eigen residual",
+                backend.name()
+            );
+            assert!(
+                (vectors.transpose() * vectors - DMatrix::identity(SAMPLES, SAMPLES)).norm()
+                    < 1e-12,
+                "{} eigenvector orthogonality",
+                backend.name()
+            );
+        }
+    }
 }
