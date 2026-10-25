@@ -1,0 +1,133 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      large_recording:
+        description: Run the full 9-million-spike Windows memory and output test
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      PREKK_REQUIRE_LAPACK: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x64
+            package_platform: windows
+            executable: target/release/prekk.exe
+          - os: macos-15
+            platform: macos-arm64
+            package_platform: macos
+            executable: target/release/prekk
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install CI-only Windows LAPACK provider
+        if: runner.os == 'Windows'
+        run: python scripts/fetch_test_lapack.py --output native-test --env-file "$GITHUB_ENV"
+      - name: Set up stable Rust and check tools
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Format, lint, and release unit tests
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --release --locked
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Package one executable without numerical DLLs
+        run: |
+          python scripts/package_rust.py --exe ${{ matrix.executable }} --output dist/prekk-${{ matrix.platform }} --platform ${{ matrix.package_platform }}
+      - name: Test standalone package and optional runtime LAPACK
+        run: python tests/check_package.py --package dist/prekk-${{ matrix.platform }}
+      - name: Optional 9-million-spike Windows test
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
+        run: |
+          python tests/check_large.py --exe ${{ matrix.executable }} --backend nalgebra --report large-nalgebra.json
+          python tests/check_large.py --exe ${{ matrix.executable }} --backend lapack --report large-lapack.json
+          cat large-nalgebra.json large-lapack.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prekk-${{ matrix.platform }}
+          path: dist/prekk-${{ matrix.platform }}/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
+        with:
+          name: large-recording-windows-x64
+          path: large-*.json
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: prekk-release-${{ github.sha }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: prekk-*
+          path: artifacts
+      - name: Package releases and select commit tag
+        id: package
+        run: |
+          echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import zipfile
+
+          output = Path('release')
+          output.mkdir()
+          packages = sorted(Path('artifacts').glob('prekk-*'))
+          if len(packages) != 2:
+              raise RuntimeError('Expected one Windows and one macOS package')
+          for package in packages:
+              archive = output / (package.name + '.zip')
+              with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
+                  for item in sorted(package.iterdir()):
+                      if package.name.startswith('prekk-macos-') and item.name == 'prekk':
+                          item.chmod(0o755)
+                      bundle.write(item, item.name)
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')
+          PY
+      - name: Publish GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.package.outputs.tag }}
+          commit: ${{ github.sha }}
+          name: prekk ${{ steps.package.outputs.tag }}
+          body: Built and tested from commit ${{ github.sha }}. Each platform has one executable, using nalgebra by default and optional LAPACK loaded at runtime. No numerical DLLs are bundled or required to start.
+          artifacts: release/*.zip,release/*.sha256
+          artifactErrorsFailBuild: true
+          allowUpdates: true
+          makeLatest: true

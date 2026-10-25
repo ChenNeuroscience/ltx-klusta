@@ -1,4 +1,4 @@
-Debug
-Release
-build/
 dist/
+target/
+native-test/
+__pycache__/

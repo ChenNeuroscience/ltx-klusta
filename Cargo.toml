@@ -1,0 +1,16 @@
+[package]
+name = "prekk"
+version = "0.1.0"
+edition = "2021"
+description = "Stream Axona tetrode recordings into KlustaKwik features"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+nalgebra = { version = "0.35.0", default-features = false, features = ["std"] }
+libloading = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

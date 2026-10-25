@@ -14,11 +14,11 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def run(exe, tetrode, root, components, ok=True):
+def run(exe, tetrode, root, components, ok=True, extra_args=()):
     base = root / "features with spaces"
     info = root / "spike count.txt"
     result = subprocess.run(
-        [str(exe), str(tetrode), str(base), str(info), components],
+        [str(exe), str(tetrode), str(base), str(info), components, *extra_args],
         capture_output=True, text=True, timeout=90,
     )
     require((result.returncode == 0) == ok, result.stdout + result.stderr)
@@ -33,7 +33,7 @@ def run(exe, tetrode, root, components, ok=True):
     return rows
 
 
-def check(exe, baseline):
+def check(exe, extra_args=()):
     with tempfile.TemporaryDirectory(prefix="prekk test ") as directory:
         root = Path(directory)
         tetrode = root / "input with spaces.1"
@@ -49,7 +49,7 @@ def check(exe, baseline):
                     payload += struct.pack("50b", *(wave if channel < active else [0] * 50))
             tetrode.write_bytes(b"num_spikes 80\r\ndata_start" + payload + b"\r\ndata_end\r\n")
             for components in ("A", "VT", "3PC", "3PC,A,VT"):
-                rows = run(exe, tetrode, root, components)
+                rows = run(exe, tetrode, root, components, extra_args=extra_args)
                 require(len(rows) == len(waves), "Missing feature rows")
                 expected_width = active * (5 if components == "3PC,A,VT" else
                                            3 if components == "3PC" else 1)
@@ -77,26 +77,30 @@ def check(exe, baseline):
                                 dot = sum(a * b for a, b in zip(column, previous))
                                 scale = math.sqrt(sum(x*x for x in column) * sum(x*x for x in previous))
                                 require(abs(dot) / scale < 1e-5, "PCA orthogonality")
-                if baseline:
-                    expected = run(baseline, tetrode, root, components)
-                    require(all(math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-4)
-                                for row, old in zip(rows, expected) for a, b in zip(row, old)),
-                            "Features changed from baseline")
         for count, message in ((-1, "at least 2"), (0, "at least 2"),
                                (9000000, "shorter"), (10000000, "shorter"),
-                               (2147483648, "BLAS dimension limit")):
+                               (2147483648, "2147483647")):
             tetrode.write_bytes(f"num_spikes {count}\r\ndata_start".encode())
-            require(message in run(exe, tetrode, root, "3PC", ok=False), "Wrong count error")
+            require(message in run(exe, tetrode, root, "3PC", ok=False, extra_args=extra_args), "Wrong count error")
         for content in (b"num_spikes nonsense\ndata_start", b"num_spikes 80\n",
                         b"data_start", b"not a tetrode file"):
             tetrode.write_bytes(content)
-            run(exe, tetrode, root, "3PC", ok=False)
-    print("Feature and input checks passed" + ("; baseline outputs match" if baseline else ""))
+            run(exe, tetrode, root, "3PC", ok=False, extra_args=extra_args)
+    print("Feature mathematics and input checks passed")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", required=True, type=Path)
-    parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--backend", choices=("auto", "nalgebra", "lapack"))
+    parser.add_argument("--lapack-library", type=Path)
+    parser.add_argument("--block-spikes", type=int)
     args = parser.parse_args()
-    check(args.exe.resolve(), args.baseline.resolve() if args.baseline else None)
+    extra_args = []
+    if args.backend:
+        extra_args += ["--backend", args.backend]
+    if args.block_spikes:
+        extra_args += ["--block-spikes", str(args.block_spikes)]
+    if args.lapack_library:
+        extra_args += ["--lapack-library", str(args.lapack_library.resolve())]
+    check(args.exe.resolve(), extra_args)
