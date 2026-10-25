@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <sstream>
+#include <cstdint>
 #include "armadillo"
 /**
  * @brief A namespace for statistical analysis
@@ -66,7 +67,7 @@ public:
 	 * @brief Returns the number of records assigned to pca
 	 * @return The number of records
 	 */
-	long get_num_records() const;
+	std::int64_t get_num_records() const;
 	/**
 	 * @brief Sets whether to normalize each variable using the
 	 *  temporal standard deviation prior to solving the eigenproblem
@@ -252,8 +253,8 @@ public:
 protected:
 
 	long num_vars_;
-	long num_records_;
-	long record_buffer_;
+	std::int64_t num_records_;
+	std::int64_t record_buffer_;
 	std::string solver_;
 	bool do_normalize_;
 	bool do_bootstrap_;

@@ -1,0 +1,39 @@
+name: Build Windows x64
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Configure x64
+        run: cmake -S . -B build -A x64 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Verify x64 executable and feature extraction
+        run: |
+          python -c "import pathlib,struct; p=pathlib.Path('build/Release/prekk.exe').read_bytes(); o=struct.unpack_from('<I',p,0x3c)[0]; assert struct.unpack_from('<H',p,o+4)[0] == 0x8664, 'Expected x64 PE executable'"
+          ctest --test-dir build -C Release --output-on-failure
+      - name: Package executable with matching x64 libraries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item build/Release/prekk.exe, build/Release/blas_win64_MT.dll, build/Release/lapack_win64_MT.dll, README.md -Destination dist
+          Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prekk-windows-x64
+          path: dist/
+          if-no-files-found: error

@@ -303,7 +303,7 @@ long pca::get_num_variables() const {
 	return num_vars_;
 }
 
-long pca::get_num_records() const {
+std::int64_t pca::get_num_records() const {
 	return num_records_;
 }
 
