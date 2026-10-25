@@ -1,140 +1,207 @@
-# prekk
+# fancykk
 
-Stream Axona tetrode voltage recordings into KlustaKwik feature files using Rust.
-Each recording is read twice in fixed-size blocks, so RAM use depends on the
-block size rather than the total spike count.
+Rust feature extraction and classic KlustaKwik clustering for Axona tetrode
+recordings. This combines the old `prekk.exe`, `KlustaKwik.exe`, and `runkk.bat`
+workflow into one executable: `fancykk.exe` on Windows x64 or `fancykk` on macOS
+Apple Silicon. No numerical DLLs are required. LAPACK is an optional runtime
+provider for PCA.
 
-There is **one executable per platform**, with no required numerical DLLs.
-Windows downloads contain `prekk.exe`; Apple Silicon downloads contain `prekk`.
-Both support pure Rust calculations and optional LAPACK loaded at runtime.
+The clustering port is ready for evaluation on representative recordings.
+See [CLUSTERING.md](CLUSTERING.md) for the exact supported algorithm, numerical
+compatibility, memory/storage requirements, and validation performed so far.
 
-## Usage
-
-The existing four positional arguments remain compatible with `runkk.bat`:
+## Sort recordings
 
 ```sh
-prekk recording.1 temporary/recording temporary/count.txt 3PC
-prekk recording.1 temporary/recording temporary/count.txt 3PC,A,VT --block-spikes 8192
-prekk --help
-prekk --version
-prekk --completions powershell
-prekk --completions zsh > _prekk
+fancykk sort recording.1
+fancykk sort recording.1 recording.2 --backend auto
+fancykk sort recording.1 --force
+fancykk --help
+fancykk sort --help
+fancykk --completions powershell
 ```
 
-Create the output directories first. Paths may contain Unicode and spaces.
-The output is `OUTPUT_BASE.fet.N`, where N is the input file's numeric extension.
-The count file contains only the number of spikes.
+Drag recordings onto the Windows executable or a shortcut to it to run the
+same sorting operation with default settings. Paths may contain spaces,
+Unicode, and punctuation. Results are written beside each input:
+`recording.1` becomes `recording.clu.1`. Existing results are skipped unless
+`--force` is given. A failed job leaves any previous output intact; new output
+is published atomically after it is complete.
 
-Features are `0PC`–`9PC`, amplitude `A`, and voltage at the sample of maximum
-variance `VT`. Select at least one feature. Output order is all active channels'
-PCs, then all amplitudes, then all VT values, irrespective of argument order.
-Constant channels are omitted. Feature values use six significant digits in
-scientific notation.
+Defaults match the supplied fancykk batch file: `3PC`, classic unmasked
+clustering, initial cluster counts 20–30, seed 1, a 25,000-spike fitting target,
+and four simultaneous recordings. PCA uses every spike. Clustering fits a
+stratified subset for large recordings and assigns **all** spikes using the
+fitted model. Its historical floor rule can fit up to 49,999 spikes; nine
+million spikes use exactly 25,000 fitting spikes. Full-record assignment is
+streamed without allocating a full spikes-by-clusters array.
+
+## Shared queue
+
+Use the persistent per-user queue when jobs arrive through separate Explorer
+invocations:
+
+```sh
+fancykk enqueue recording.1 recording.2 --background
+fancykk status
+fancykk status --json
+fancykk resume
+```
+
+`enqueue` without `--background` participates in the queue in the foreground.
+One coordinator processes at most four jobs at once by default, even when
+several processes submit recordings. Its `--jobs` value sets the active limit.
+Duplicate pending/running recordings share one job. Completed jobs can be
+submitted again; existing `.clu.N` files are still skipped by default.
+
+Each job has a durable pending/running/done/failed record and a diagnostic log.
+A failed recording frees its worker slot and does not block subsequent jobs.
+After a coordinator is interrupted, `resume` or another `enqueue` recovers its
+running jobs and clears their old private scratch files before retrying them.
+Queue history and logs remain available through `status`.
+
+The default queue is `%LOCALAPPDATA%\fancykk\queue` on Windows and
+`~/Library/Application Support/fancykk/queue` on macOS. `--queue-dir PATH`
+overrides it on `enqueue`, `status`, and `resume`.
+
+## Configuration
+
+Copy `fancykk.example.json` to `fancykk.json` beside the executable to customize
+the same settings previously edited at the top of the batch file:
+
+```json
+{
+  "features": "3PC",
+  "cluster": {
+    "min_clusters": 20,
+    "max_clusters": 30,
+    "target_spikes": 25000,
+    "seed": 1,
+    "max_iterations": 10000
+  },
+  "backend": "nalgebra",
+  "jobs": 4
+}
+```
+
+Missing settings use defaults. Unknown or invalid settings are reported.
+`--config PATH` selects another JSON file; explicit command-line options
+override it. Configuration paths such as `work_dir` and `lapack_library` are
+resolved relative to the configuration file. Queued jobs retain the settings
+with which they were submitted.
+
+`--work-dir PATH` chooses an existing scratch folder, useful when a large
+recording needs temporary storage on another disk. Ordinary command-line jobs
+use private temporary directories, and queued jobs use private directories
+under the queue folder. The fitting target may be reduced with
+`--target-spikes`; this changes the clustering approximation. Waveform
+`--block-spikes` changes PCA memory/throughput while preserving its mathematics.
+
+## Extract features only
+
+The former prekk operation is available as a subcommand:
+
+```sh
+fancykk features recording.1 temporary/recording temporary/count.txt 3PC
+fancykk features recording.1 temporary/recording temporary/count.txt 3PC,A,VT --backend auto
+```
+
+Create the output directories first. This writes `OUTPUT_BASE.fet.N` and a
+count file. Features are `0PC`–`9PC`, amplitude `A`, and voltage at the sample
+of maximum variance `VT`. Select at least one feature. Column order is all
+active channels' PCs, then all amplitudes, then all VT values. Constant channels
+are omitted. Values have six significant digits in scientific notation.
+
+The old four-argument top-level invocation has moved to `features`; the old
+batch file should be replaced with the combined `sort` or `enqueue` operation.
 
 ## Numerical backend
 
 | Option | Behaviour |
 | --- | --- |
-| `--backend nalgebra` | Default. Pure Rust; no numerical library is loaded. |
-| `--backend auto` | Use an available compatible LAPACK provider, otherwise nalgebra. |
-| `--backend lapack` | Require LAPACK; report an error if no compatible provider is found. |
-| `--lapack-library PATH` | Load a specific provider; implies LAPACK unless a backend is specified. |
+| `--backend nalgebra` | Default: pure Rust calculations. |
+| `--backend auto` | Use a compatible LAPACK provider if available, otherwise nalgebra. |
+| `--backend lapack` | Require a compatible provider. |
+| `--lapack-library PATH` | Select a provider explicitly; implies LAPACK unless a backend is specified. |
 
-For example:
+An explicit library path must work, including in `auto` mode. It cannot be
+combined with `--backend nalgebra`. The selected provider is logged.
+`FANCYKK_LAPACK_LIBRARY` supplies a preferred discovery path.
 
-```sh
-prekk recording.1 temporary/recording temporary/count.txt 3PC --backend auto
-prekk recording.1 temporary/recording temporary/count.txt 3PC --lapack-library /path/to/library
-```
+macOS discovery includes the system Accelerate framework. Windows searches
+beside the executable and on PATH for LP64 OpenBLAS/LAPACK providers, including
+existing `lapack_win64_MT.dll` + `blas_win64_MT.dll` pairs. Providers must use
+32-bit Fortran integer arguments; known ILP64 OpenBLAS libraries are rejected.
+Keep a provider's dependent DLLs beside it. No provider or DLL is bundled.
 
-An explicit library path must work, including with `--backend auto`. It cannot
-be combined with `--backend nalgebra`. The selected backend and provider path
-are printed to standard error for reproducibility.
+For each channel, PCA accumulates a global 50 × 50 covariance matrix from
+50-sample waveforms, using BLAS `DSYRK` when available. LAPACK uses `DSYEVD`,
+with a `DSYEV` retry on non-convergence. Clustering uses Rust full-covariance
+calculations on the much smaller feature space.
 
-On macOS, automatic discovery includes the system Accelerate framework.
-On Windows it searches beside the executable and on PATH for compatible
-OpenBLAS or LAPACK providers. Existing `lapack_win64_MT.dll` and
-`blas_win64_MT.dll` pairs are also recognized, but are neither included nor
-needed for the default backend. Linux discovery includes system OpenBLAS and
-LAPACK shared libraries. `PREKK_LAPACK_LIBRARY` supplies a preferred provider path.
-
-Providers must expose the Fortran **LP64** interface (32-bit integer arguments).
-Known ILP64 OpenBLAS providers are rejected. Keep any provider's own dependent
-libraries beside it. LAPACK support uses BLAS `DSYRK` to accumulate covariance,
-then `DSYEVD` for PCA, with a `DSYEV` retry on convergence failure. The original
-covariance is restored before retrying.
-
-## Matrix size and batching
-
-Each channel's waveform has 50 signed 8-bit time samples. Consequently, its PCA
-covariance matrix is **50 × 50**; this dimension comes from the waveform data.
-
-The throughput tuning parameter is `--block-spikes`, not the covariance size.
-The default 4,096-spike block supplies a 50 × 4,096 matrix of doubles per channel
-(1.56 MiB) to the covariance calculation. Larger blocks are not automatically
-faster: matrix shape, cache behaviour, backend, and file/output costs all matter.
-The default is a starting point, not a claim of optimality.
-
-Run the optional kernel benchmark locally to examine block sizes:
+The default 4,096-spike block supplies a 50 × 4,096 double matrix per channel
+(1.56 MiB). Larger blocks are not automatically faster. The optional local
+benchmark is:
 
 ```sh
 cargo test --release covariance_block_benchmark -- --ignored --nocapture
 ```
 
-It prints throughput for 512, 2,048, 4,096, 8,192, and 16,384 spikes per block,
-using nalgebra and any discovered LAPACK provider. It excludes recording I/O
-and text formatting. Routine CI does not run this benchmark.
+Repeated eigenvalues can yield different valid PCA bases, and floating-point
+differences can affect later clustering decisions. Pin the numerical backend
+and seed when reproducibility matters.
 
-The reader expects four channels per spike, each containing a 4-byte timestamp
-and 50 signed samples. Counts must be at least two and at most 2,147,483,647.
-Nine million spikes are below this guard; the reader allocates no array of that
-length.
+## Windows 11 context menu
 
-## Build and test
+The old registry command appears under **Show more options**. A command in the
+first Windows 11 menu requires an `IExplorerCommand` COM extension and package
+identity, normally supplied by an optional signed sparse MSIX package. This is
+an installed integration component; the portable sorting executable remains
+independent. See [Microsoft's integration guide](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/integrate-packaged-app-with-file-explorer).
 
-With a current stable Rust toolchain:
+This branch provides the safe multi-file queue command that an extension can
+invoke, but does not yet install a modern Explorer extension. Such an extension
+should filter numeric recording extensions, enumerate the selection, and call
+`fancykk enqueue --background` with individual paths, without a command shell.
+It must keep menu construction fast and leave processing to the queue.
+GitHub's Windows runner can test its COM and package behaviour, but visual menu
+placement still needs a Windows 11 desktop check.
+
+For the existing menu, **Shift+F10** opens the classic menu directly without
+clicking Show more options. See [Microsoft's menu guidance](https://blogs.windows.com/blog/2021/07/19/extending-the-context-menu-and-share-dialog-in-windows-11/).
+
+## Build, test, and releases
 
 ```sh
 cargo build --release --locked
 cargo test --release --locked
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-python3 tests/check_features.py --exe target/release/prekk
-python3 tests/check_rust.py --exe target/release/prekk
+python3 tests/check_features.py --exe target/release/fancykk
+python3 tests/check_rust.py --exe target/release/fancykk
+python3 tests/check_sort.py --exe target/release/fancykk
 ```
 
-On Windows the executable has the `.exe` suffix. No LAPACK installation is
-needed to build or run the default backend, and Windows uses a static C runtime.
-`Cargo.lock` fixes dependency versions.
+Use a current stable Rust toolchain. Windows executables have the `.exe` suffix
+and use a static C runtime. No numerical library is needed to build or run.
+The input format is four channels per spike, each with a 4-byte timestamp and
+50 signed 8-bit samples. Supported counts are 2 through 2,147,483,647; nine
+million is below this bound. The count guard is not a guarantee of runtime or
+available disk capacity at its upper extreme.
 
-The `Build` workflow builds and executes the same program on Windows x64 and
-macOS Apple Silicon. Tests cover mathematical feature properties, covariance
-products, eigenvector residuals/orthogonality, rank-deficient and tied-eigenvalue
-PCA, chunk boundaries, CLI/completions, Unicode paths, output safety, and runtime
-provider selection. Windows CI downloads a checksum-pinned LP64 OpenBLAS provider
-only for testing; it is never included in the package. There is no separate
-native build and no startup BLAS/LAPACK import.
+The `Build` workflow builds and tests the packaged executable on Windows x64
+and macOS Apple Silicon with both numerical backends. It checks PCA mathematics,
+CLI/completions, full sorting and subsets, output safety, shared queue failures
+and crash recovery, and execution without installed numerical libraries.
+Windows CI downloads a checksum-pinned OpenBLAS provider for tests only.
 
-The optional **large_recording** checkbox in **Run workflow** runs the full
-9-million-spike Windows test with a 256 MiB peak-working-set ceiling. It is off
-by default. A smaller local check is:
-
-```sh
-python3 tests/check_large.py --exe target/release/prekk --spikes 100000
-```
-
-## Downloads and releases
+The optional **large_recording** workflow checkbox runs a nine-million-spike
+**feature extraction** memory test on Windows. It is off by default and does
+not run the full clustering search. Routine CI uses small synthetic recordings.
 
 Successful main builds publish [GitHub releases](https://github.com/ChenNeuroscience/prekk/releases)
-tagged with the short source commit ID. Each release contains one ZIP per
-platform plus ZIP checksums. Packages include the executable, this README, build
-metadata, dependency notices, and file checksums; no numerical DLLs are bundled.
-
-PR and manual branch runs provide test artifacts. For a macOS Actions artifact,
-run `chmod +x prekk` after extraction because GitHub resets artifact permissions.
-Published release ZIPs restore the executable permission automatically.
-
-Eigenvectors are sorted by decreasing eigenvalue with their largest absolute
-loading positive. Repeated eigenvalues can yield different valid bases, and
-floating-point results can differ across backends. Pin the backend when numerical
-reproducibility matters for an analysis.
+tagged with the source commit ID. Each platform has one ZIP plus its checksum.
+Packages include the executable, documentation, example settings, build
+metadata, dependency notices, and file checksums. PR builds provide test
+artifacts. For a macOS Actions artifact, run `chmod +x fancykk` after extracting;
+release ZIPs preserve the executable permission automatically.

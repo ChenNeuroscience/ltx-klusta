@@ -1,0 +1,12 @@
+{
+  "features": "3PC",
+  "cluster": {
+    "min_clusters": 20,
+    "max_clusters": 30,
+    "target_spikes": 25000,
+    "seed": 1,
+    "max_iterations": 10000
+  },
+  "backend": "nalgebra",
+  "jobs": 4
+}

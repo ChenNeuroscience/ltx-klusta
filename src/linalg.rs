@@ -2,7 +2,18 @@ use crate::{native::NativeLapack, Error, Result, SAMPLES};
 use nalgebra::{linalg::SymmetricEigen, DMatrix};
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Backend {
     /// Detect a compatible native provider, otherwise use nalgebra
     Auto,
@@ -76,7 +87,7 @@ mod tests {
     fn engines() -> Vec<Engine> {
         let mut values = vec![Engine::resolve(Backend::Nalgebra, None).unwrap()];
         let native = Engine::resolve(Backend::Lapack, None);
-        if std::env::var_os("PREKK_REQUIRE_LAPACK").is_some() {
+        if std::env::var_os("FANCYKK_REQUIRE_LAPACK").is_some() {
             assert!(
                 native.is_ok(),
                 "CI requires LAPACK: {}",
@@ -161,7 +172,7 @@ mod tests {
 
     #[test]
     fn explicit_missing_library_is_an_error() {
-        let missing = Path::new("prekk-provider-that-does-not-exist");
+        let missing = Path::new("fancykk-provider-that-does-not-exist");
         assert!(Engine::resolve(Backend::Lapack, Some(missing)).is_err());
         assert!(Engine::resolve(Backend::Auto, Some(missing)).is_err());
         assert!(Engine::resolve(Backend::Nalgebra, Some(missing)).is_err());

@@ -18,7 +18,7 @@ def run(exe, tetrode, root, components, ok=True, extra_args=()):
     base = root / "features with spaces"
     info = root / "spike count.txt"
     result = subprocess.run(
-        [str(exe), str(tetrode), str(base), str(info), components, *extra_args],
+        [str(exe), "features", str(tetrode), str(base), str(info), components, *extra_args],
         capture_output=True, text=True, timeout=90,
     )
     require((result.returncode == 0) == ok, result.stdout + result.stderr)
@@ -34,7 +34,7 @@ def run(exe, tetrode, root, components, ok=True, extra_args=()):
 
 
 def check(exe, extra_args=()):
-    with tempfile.TemporaryDirectory(prefix="prekk test ") as directory:
+    with tempfile.TemporaryDirectory(prefix="fancykk test ") as directory:
         root = Path(directory)
         tetrode = root / "input with spaces.1"
         rng = random.Random(943)

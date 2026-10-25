@@ -263,7 +263,7 @@ fn check_integer_abi(library: &Library) -> Result<()> {
 
 fn candidates() -> Vec<PathBuf> {
     let mut result = Vec::new();
-    if let Some(path) = std::env::var_os("PREKK_LAPACK_LIBRARY") {
+    if let Some(path) = std::env::var_os("FANCYKK_LAPACK_LIBRARY") {
         result.push(path.into());
     }
     #[cfg(windows)]
