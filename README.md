@@ -1,109 +1,140 @@
 # prekk
 
-The experimental Rust rewrite is documented in [RUST.md](RUST.md), including
-the CLI, optional LAPACK backend, streaming design, and native Windows/macOS CI.
-The notes below describe the retained C++ reference and its previous release.
+Stream Axona tetrode voltage recordings into KlustaKwik feature files using Rust.
+Each recording is read twice in fixed-size blocks, so RAM use depends on the
+block size rather than the total spike count.
 
-Extract KlustaKwik features from Axona tetrode files: principal components,
-amplitude (`A`), and voltage at the sample with maximum variance (`VT`).
-Input records contain four channels, each with a 4-byte timestamp and 50 signed
-8-bit voltage samples. The existing command line and feature ordering are retained.
+There is **one executable per platform**, with no required numerical DLLs.
+Windows downloads contain `prekk.exe`; Apple Silicon downloads contain `prekk`.
+Both support pure Rust calculations and optional LAPACK loaded at runtime.
 
-## Windows x64 download
+## Usage
 
-Open this repository's [Releases](https://github.com/ChenNeuroscience/prekk/releases)
-and download `prekk-windows-x64.zip` from the latest release. Each release is
-tagged with the short Git commit ID of its source, with a ZIP checksum provided
-as a separate `.sha256` asset. Unzip the download before running.
-
-The workflow builds and tests on pull requests and pushes to `main`. Successful
-pushes to `main` publish a release automatically. It also supports **Actions →
-Build Windows x64 → Run workflow** after it is on the default branch; a successful
-manual run publishes the selected commit. Pull requests do not publish releases.
-The `prekk-windows-x64` Actions artifact remains available for testing PR builds.
-
-The download contains `prekk.exe`, `blas_win64_MT.dll`, `lapack_win64_MT.dll`,
-this README, and SHA-256 checksums. Keep all three executable/library files
-together. Back up the old executable, then copy these three files into your
-existing `fancykk` directory. The existing `runkk.bat` command line still applies:
-
-```bat
-prekk.exe "C:\data\recording.1" "C:\temp\recording" "C:\temp\spike-count.txt" 3PC
-```
-
-This writes `C:\temp\recording.fet.1` and the spike-count file.
-The Windows tests execute feature extraction with the packaged x64 libraries;
-CI also checks the PE architecture of the executable.
-
-## Memory and spike counts
-
-The target recording size for this build is **up to 9 million spikes**, subject
-to available RAM. A 64-bit operating system alone does not remove the address
-limit of an old 32-bit `prekk.exe`.
-
-The original calculation `long bufferSize = BYTES_PER_SPIKE*nSpikes` multiplies
-two 32-bit `int` values before assigning to `long`. It overflows at 9,942,054
-spikes (216 bytes each), even if compiled for x64. Windows `long` is also 32-bit.
-This build uses checked 64-bit counts and buffer sizes and explicitly requires
-64-bit pointers and Armadillo indices. Regression checks cover 9 million spikes,
-the old signed overflow boundary, and payload sizes over 4 GiB without allocating
-those payloads.
-
-Nine million spikes have a raw payload of 1,944,000,000 bytes (1.81 GiB). PCA
-needs considerably more memory: each 9,000,000 × 50 double matrix alone is
-3,600,000,000 bytes (3.35 GiB), and this implementation holds several waveform
-and PCA matrices at once. This change removes the 32-bit process ceiling; it
-does not make PCA stream data or guarantee that a 9-million-spike run fits a
-particular machine. The feature tests use small synthetic recordings; a complete
-9-million-spike PCA run is not part of CI.
-
-The numerical libraries still use 32-bit BLAS dimensions. Counts above
-2,147,483,647 are explicitly rejected. Invalid headers, short payloads, allocation
-failures, and output failures produce an error and a nonzero exit status.
-
-## KlustaKwik
-
-The separate `KlustaKwik.exe` does not need rebuilding just to replace a 32-bit
-prekk. The examined `fancykk` distribution already has an x64 KlustaKwik.
-Its batch file uses classic mode, 20–30 starting clusters, the executable's
-default maximum of 100 possible clusters, and a `Subset` factor derived from
-25,000 spikes. That subsampling controls clustering work, not prekk's input size.
-
-Older KlustaKwik source uses 32-bit array indices even in x64 builds. For an
-`N × MaxPossibleClusters` array, a signed 32-bit element index reaches its limit
-at approximately `2147483647 / MaxPossibleClusters` spikes: about 21.47 million
-at 100 clusters. Nine million is below that boundary. Increasing the cluster
-limit changes it, and KlustaKwik can still exhaust physical RAM.
-
-Upstream replaced those indices in [September 2014](https://github.com/klusta-team/klustakwik/commit/3208a6fba25de34ef510a87d12f1e4f76fff25e8)
-and later added a configurable [`RamLimitGB`](https://github.com/klusta-team/klustakwik/blob/d8b750107fef53996957d774dfa3ec71f2442462/parameters.h).
-The examined executable has a June 2014 PE timestamp and no `RamLimitGB` option
-in its embedded parameter list; its bundled readme describes a modified upstream
-build. Its exact source revision is unknown. Do not assume that current upstream
-options apply to that binary. No KlustaKwik fork is required for the current
-9-million-spike target based on the identified limits and existing settings.
-
-## Build from source
-
-Windows, with Visual Studio C++ tools and CMake installed:
-
-```bat
-cmake -S . -B build -A x64
-cmake --build build --config Release --parallel
-ctest --test-dir build -C Release --output-on-failure
-```
-
-The resulting executable and matching DLLs are in `build/Release`.
-Linux requires BLAS/LAPACK development libraries; macOS uses Accelerate:
+The existing four positional arguments remain compatible with `runkk.bat`:
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+prekk recording.1 temporary/recording temporary/count.txt 3PC
+prekk recording.1 temporary/recording temporary/count.txt 3PC,A,VT --block-spikes 8192
+prekk --help
+prekk --version
+prekk --completions powershell
+prekk --completions zsh > _prekk
 ```
 
-Tests require Python 3 and use only its standard library. They check feature
-ordering, signed samples, inactive channels, PCA centering/orthogonality, amplitude,
-VT, filenames containing spaces, malformed inputs, and large-count arithmetic.
-`tests/check_features.py --exe PATH --baseline OLD_PATH` additionally compares
-feature values with an existing executable on the same platform.
+Create the output directories first. Paths may contain Unicode and spaces.
+The output is `OUTPUT_BASE.fet.N`, where N is the input file's numeric extension.
+The count file contains only the number of spikes.
+
+Features are `0PC`–`9PC`, amplitude `A`, and voltage at the sample of maximum
+variance `VT`. Select at least one feature. Output order is all active channels'
+PCs, then all amplitudes, then all VT values, irrespective of argument order.
+Constant channels are omitted. Feature values use six significant digits in
+scientific notation.
+
+## Numerical backend
+
+| Option | Behaviour |
+| --- | --- |
+| `--backend nalgebra` | Default. Pure Rust; no numerical library is loaded. |
+| `--backend auto` | Use an available compatible LAPACK provider, otherwise nalgebra. |
+| `--backend lapack` | Require LAPACK; report an error if no compatible provider is found. |
+| `--lapack-library PATH` | Load a specific provider; implies LAPACK unless a backend is specified. |
+
+For example:
+
+```sh
+prekk recording.1 temporary/recording temporary/count.txt 3PC --backend auto
+prekk recording.1 temporary/recording temporary/count.txt 3PC --lapack-library /path/to/library
+```
+
+An explicit library path must work, including with `--backend auto`. It cannot
+be combined with `--backend nalgebra`. The selected backend and provider path
+are printed to standard error for reproducibility.
+
+On macOS, automatic discovery includes the system Accelerate framework.
+On Windows it searches beside the executable and on PATH for compatible
+OpenBLAS or LAPACK providers. Existing `lapack_win64_MT.dll` and
+`blas_win64_MT.dll` pairs are also recognized, but are neither included nor
+needed for the default backend. Linux discovery includes system OpenBLAS and
+LAPACK shared libraries. `PREKK_LAPACK_LIBRARY` supplies a preferred provider path.
+
+Providers must expose the Fortran **LP64** interface (32-bit integer arguments).
+Known ILP64 OpenBLAS providers are rejected. Keep any provider's own dependent
+libraries beside it. LAPACK support uses BLAS `DSYRK` to accumulate covariance,
+then `DSYEVD` for PCA, with a `DSYEV` retry on convergence failure. The original
+covariance is restored before retrying.
+
+## Matrix size and batching
+
+Each channel's waveform has 50 signed 8-bit time samples. Consequently, its PCA
+covariance matrix is **50 × 50**; this dimension comes from the waveform data.
+
+The throughput tuning parameter is `--block-spikes`, not the covariance size.
+The default 4,096-spike block supplies a 50 × 4,096 matrix of doubles per channel
+(1.56 MiB) to the covariance calculation. Larger blocks are not automatically
+faster: matrix shape, cache behaviour, backend, and file/output costs all matter.
+The default is a starting point, not a claim of optimality.
+
+Run the optional kernel benchmark locally to examine block sizes:
+
+```sh
+cargo test --release covariance_block_benchmark -- --ignored --nocapture
+```
+
+It prints throughput for 512, 2,048, 4,096, 8,192, and 16,384 spikes per block,
+using nalgebra and any discovered LAPACK provider. It excludes recording I/O
+and text formatting. Routine CI does not run this benchmark.
+
+The reader expects four channels per spike, each containing a 4-byte timestamp
+and 50 signed samples. Counts must be at least two and at most 2,147,483,647.
+Nine million spikes are below this guard; the reader allocates no array of that
+length.
+
+## Build and test
+
+With a current stable Rust toolchain:
+
+```sh
+cargo build --release --locked
+cargo test --release --locked
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+python3 tests/check_features.py --exe target/release/prekk
+python3 tests/check_rust.py --exe target/release/prekk
+```
+
+On Windows the executable has the `.exe` suffix. No LAPACK installation is
+needed to build or run the default backend, and Windows uses a static C runtime.
+`Cargo.lock` fixes dependency versions.
+
+The `Build` workflow builds and executes the same program on Windows x64 and
+macOS Apple Silicon. Tests cover mathematical feature properties, covariance
+products, eigenvector residuals/orthogonality, rank-deficient and tied-eigenvalue
+PCA, chunk boundaries, CLI/completions, Unicode paths, output safety, and runtime
+provider selection. Windows CI downloads a checksum-pinned LP64 OpenBLAS provider
+only for testing; it is never included in the package. There is no separate
+native build and no startup BLAS/LAPACK import.
+
+The optional **large_recording** checkbox in **Run workflow** runs the full
+9-million-spike Windows test with a 256 MiB peak-working-set ceiling. It is off
+by default. A smaller local check is:
+
+```sh
+python3 tests/check_large.py --exe target/release/prekk --spikes 100000
+```
+
+## Downloads and releases
+
+Successful main builds publish [GitHub releases](https://github.com/ChenNeuroscience/prekk/releases)
+tagged with the short source commit ID. Each release contains one ZIP per
+platform plus ZIP checksums. Packages include the executable, this README, build
+metadata, dependency notices, and file checksums; no numerical DLLs are bundled.
+
+PR and manual branch runs provide test artifacts. For a macOS Actions artifact,
+run `chmod +x prekk` after extraction because GitHub resets artifact permissions.
+Published release ZIPs restore the executable permission automatically.
+
+Eigenvectors are sorted by decreasing eigenvalue with their largest absolute
+loading positive. Repeated eigenvalues can yield different valid bases, and
+floating-point results can differ across backends. Pin the backend when numerical
+reproducibility matters for an analysis.

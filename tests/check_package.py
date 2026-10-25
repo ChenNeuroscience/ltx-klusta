@@ -36,40 +36,67 @@ def imports(exe):
     return names
 
 
-def check(package, backend, baseline):
+def runtime_selection(executable, native_flags):
+    from check_rust import command, write_recording
+    with tempfile.TemporaryDirectory(prefix="prekk backend ") as temporary:
+        root = Path(temporary)
+        recording = root / "wave.1"
+        write_recording(recording, [[(i-10)*((j%5)-2) for j in range(50)] for i in range(21)])
+        args = (recording, root / "out", root / "count", "3PC")
+        default = command(executable, *args)
+        require(default.returncode == 0 and "nalgebra backend" in default.stderr, default.stderr)
+        automatic = command(executable, *args, "--backend", "auto")
+        expected = "nalgebra backend" if os.name == "nt" else "lapack ("
+        require(automatic.returncode == 0 and expected in automatic.stderr, automatic.stderr)
+        explicit = command(executable, *args, *native_flags)
+        require(explicit.returncode == 0 and "lapack (" in explicit.stderr, explicit.stderr)
+        for backend in ("auto", "lapack"):
+            invalid = command(executable, *args, "--backend", backend, "--lapack-library", root / "missing-library")
+            require(invalid.returncode != 0, "An explicit missing provider must be reported")
+        provider = native_flags[-1] if "--lapack-library" in native_flags else None
+        if provider:
+            environment = os.environ.copy()
+            environment["PREKK_LAPACK_LIBRARY"] = str(provider)
+            automatic = command(executable, *args, "--backend", "auto", env=environment)
+            require(automatic.returncode == 0 and "lapack (" in automatic.stderr, automatic.stderr)
+
+
+def check(package, library):
     executable = package / ("prekk.exe" if os.name == "nt" else "prekk")
     for line in (package / "SHA256SUMS.txt").read_text().splitlines():
         expected, name = line.split("  ", 1)
         require(hashlib.sha256((package / name).read_bytes()).hexdigest() == expected, f"Checksum mismatch: {name}")
+    require(not list(package.glob("*.dll")), "The package should contain no numerical DLLs")
     if os.name == "nt":
-        required = {"blas_win64_mt.dll", "lapack_win64_mt.dll"} if backend == "lapack" else set()
         actual = {name for name in imports(executable) if "blas" in name or "lapack" in name}
-        require(actual == required, f"Unexpected numerical DLL imports: {actual}")
-        require({p.name.lower() for p in package.glob('*.dll')} == required, "Wrong packaged DLLs")
-        print("Windows DLL imports:", ", ".join(sorted(imports(executable))))
+        require(not actual, f"Numerical DLLs must not be startup dependencies: {actual}")
+        print("Windows startup DLLs:", ", ".join(sorted(imports(executable))))
         system = Path(os.environ["SystemRoot"])
-        # Child processes can see only their own directory and Windows system DLLs.
         os.environ["PATH"] = os.pathsep.join(map(str, (system / "System32", system)))
     elif sys.platform == "darwin":
         dependencies = subprocess.check_output(["/usr/bin/otool", "-L", str(executable)], text=True)
-        require(("Accelerate.framework" in dependencies) == (backend == "lapack"), "Unexpected Accelerate linkage")
-    with tempfile.TemporaryDirectory(prefix="prekk isolated package ") as directory:
+        require("Accelerate.framework" not in dependencies, "Accelerate must be loaded only at runtime")
+    os.environ.pop("PREKK_LAPACK_LIBRARY", None)
+    native_flags = ["--backend", "lapack"]
+    if library:
+        native_flags += ["--lapack-library", str(library)]
+    with tempfile.TemporaryDirectory(prefix="prekk isolated package ") as temporary:
         previous = Path.cwd()
         try:
-            os.chdir(directory)
-            check_features(executable, baseline, ("--block-spikes", "7"))
-            if backend == "lapack":
-                check_features(executable, baseline, ("--backend", "nalgebra", "--block-spikes", "7"))
-            check_rust(executable, baseline)
+            os.chdir(temporary)
+            check_features(executable, ("--backend", "nalgebra", "--block-spikes", "7"))
+            check_rust(executable, ("--backend", "nalgebra"))
+            runtime_selection(executable, native_flags)
+            check_features(executable, (*native_flags, "--block-spikes", "7"))
+            check_rust(executable, native_flags)
         finally:
             os.chdir(previous)
-    print(f"Standalone {backend} package passed")
+    print("The same executable passed nalgebra, auto detection, and runtime LAPACK checks")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--package", type=Path, required=True)
-    parser.add_argument("--backend", choices=("nalgebra", "lapack"), required=True)
-    parser.add_argument("--baseline", type=Path, required=True)
+    parser.add_argument("--lapack-library", type=Path, default=os.environ.get("PREKK_TEST_LAPACK_LIBRARY"))
     args = parser.parse_args()
-    check(args.package.resolve(), args.backend, args.baseline.resolve())
+    check(args.package.resolve(), Path(args.lapack_library).resolve() if args.lapack_library else None)

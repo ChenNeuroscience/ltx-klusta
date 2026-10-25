@@ -4,7 +4,9 @@
 compile_error!("prekk requires a 64-bit target");
 
 pub mod linalg;
+mod native;
 pub use linalg::Backend;
+use linalg::Engine;
 use nalgebra::DMatrix;
 use std::fmt;
 use std::fs::{self, File};
@@ -24,6 +26,7 @@ pub const MAX_SPIKES: u64 = i32::MAX as u64;
 pub enum Error {
     Io(io::Error),
     Invalid(&'static str),
+    Backend(String),
     Lapack { routine: &'static str, info: i32 },
 }
 impl fmt::Display for Error {
@@ -31,6 +34,7 @@ impl fmt::Display for Error {
         match self {
             Self::Io(error) => error.fmt(f),
             Self::Invalid(message) => f.write_str(message),
+            Self::Backend(message) => f.write_str(message),
             Self::Lapack { routine, info } => write!(f, "LAPACK {routine} failed (INFO={info})"),
         }
     }
@@ -85,6 +89,7 @@ pub struct Options {
     pub info: PathBuf,
     pub features: Features,
     pub backend: Backend,
+    pub lapack_library: Option<PathBuf>,
     pub block_spikes: usize,
 }
 
@@ -224,6 +229,7 @@ fn build_models(
     reader: &mut (impl Read + Seek),
     header: &Header,
     options: &Options,
+    engine: &Engine,
     raw: &mut [u8],
 ) -> Result<Vec<ChannelModel>> {
     reader.seek(SeekFrom::Start(header.offset))?;
@@ -250,9 +256,7 @@ fn build_models(
                 }
             }
             if options.features.pcs > 0 {
-                options
-                    .backend
-                    .accumulate(&samples[..count * SAMPLES], count, &mut moment.product);
+                engine.accumulate(&samples[..count * SAMPLES], count, &mut moment.product);
             }
         }
         left -= count as u64;
@@ -271,7 +275,7 @@ fn build_models(
         }
         let mut directions = DMatrix::zeros(SAMPLES, options.features.pcs);
         if options.features.pcs > 0 {
-            let (values, vectors) = options.backend.eigen(covariance)?;
+            let (values, vectors) = engine.eigen(covariance)?;
             let mut order: Vec<_> = (0..SAMPLES).collect();
             order.sort_by(|&a, &b| values[b].total_cmp(&values[a]));
             for (pc, &index) in order.iter().take(options.features.pcs).enumerate() {
@@ -326,14 +330,15 @@ pub fn extract(options: &Options) -> Result<PathBuf> {
             "Input, feature output, and count output must be different files",
         ));
     }
+    let engine = Engine::resolve(options.backend, options.lapack_library.as_deref())?;
     eprintln!(
         "{} spikes; {} backend; blocks of {} spikes",
         header.spikes,
-        options.backend.name(),
+        engine.description(),
         options.block_spikes
     );
     let mut raw = vec![0; options.block_spikes * BYTES_PER_SPIKE];
-    let models = build_models(&mut reader, &header, options, &mut raw)?;
+    let models = build_models(&mut reader, &header, options, &engine, &mut raw)?;
     reader.seek(SeekFrom::Start(header.offset))?;
     let mut writer = BufWriter::with_capacity(1 << 20, File::create(&output)?);
     let width = models.len() * options.features.width();
@@ -351,7 +356,7 @@ pub fn extract(options: &Options) -> Result<PathBuf> {
             let wave = |channel: usize| {
                 &record[channel * (4 + SAMPLES) + 4..(channel + 1) * (4 + SAMPLES)]
             };
-            // Preserve legacy ordering: all channels' PCs, then all A, then all VT.
+            // Feature order: all channels' PCs, then all A, then all VT.
             for model in &models {
                 for direction in model.directions.column_iter() {
                     let score = wave(model.channel)
@@ -384,7 +389,7 @@ pub fn extract(options: &Options) -> Result<PathBuf> {
                 if i > 0 {
                     write!(writer, " ")?;
                 }
-                // Match the legacy six significant decimal digits; scientific text
+                // Write six significant decimal digits; scientific text
                 // is accepted by KlustaKwik and avoids huge per-record allocations.
                 write!(writer, "{value:.5e}")?;
             }

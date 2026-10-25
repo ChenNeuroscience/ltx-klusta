@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 
-from check_features import require, run
+from check_features import require
 
 
 def windows_peak(process):
@@ -30,7 +30,7 @@ def windows_peak(process):
     return counters.peak
 
 
-def check(exe, baseline, spikes, report):
+def check(exe, spikes, report, extra_args=()):
     require(spikes >= 250 and spikes % 250 == 0, "spikes must be a positive multiple of 250")
     rng = random.Random(943)
     bank = bytearray()
@@ -40,8 +40,6 @@ def check(exe, baseline, spikes, report):
     with tempfile.TemporaryDirectory(prefix="prekk scale ") as directory:
         root = Path(directory)
         recording = root / "scale.1"
-        recording.write_bytes(b"num_spikes 250\r\ndata_start" + bank)
-        reference = run(baseline, recording, root, "3PC")
         with recording.open("wb") as output:
             output.write(f"num_spikes {spikes}\r\ndata_start".encode())
             block = bank * 128
@@ -50,7 +48,7 @@ def check(exe, baseline, spikes, report):
                 output.write(block)
             output.write(bank * remainder)
         started = time.monotonic()
-        process = subprocess.Popen([str(exe), str(recording), str(root / "large"), str(root / "count"), "3PC"],
+        process = subprocess.Popen([str(exe), str(recording), str(root / "large"), str(root / "count"), "3PC", *extra_args],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         peak = 0
         while process.poll() is None:
@@ -71,22 +69,24 @@ def check(exe, baseline, spikes, report):
         require(process.returncode == 0, stdout + stderr)
         if os.name != "nt":
             import resource
-            # Maximum across the small C++ reference and Rust child on Unix.
+            # Maximum resident size of the Rust child on Unix.
             peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
             if os.sys.platform != "darwin":
                 peak *= 1024
         require(peak > 0 and peak < 256 * 1024**2, f"Peak memory exceeds 256 MiB: {peak}")
         require(int((root / "count").read_text()) == spikes, "Wrong large-recording spike count")
         rows = 0
+        first_period = []
         with (root / "large.fet.1").open() as features:
             require(int(next(features)) == 12, "Wrong large-recording feature width")
             for rows, line in enumerate(features, 1):
                 if rows <= 250 or rows > spikes - 250:
                     values = list(map(float, line.split()))
-                    expected = reference[(rows - 1) % 250]
                     require(len(values) == 12 and all(math.isfinite(v) for v in values), "Invalid large-recording features")
-                    require(all(math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-4) for a, b in zip(values, expected)),
-                            "Large-recording features differ from the C++ reference")
+                    if rows <= 250:
+                        first_period.append(values)
+                    else:
+                        require(values == first_period[(rows - 1) % 250], "Repeated waveforms produced inconsistent features")
         require(rows == spikes, f"Expected {spikes} rows, found {rows}")
     results = {"spikes": spikes, "seconds": round(seconds, 3), "peak_bytes": peak,
                "memory_measurement": "Windows process peak working set" if os.name == "nt" else "Unix maximum child RSS"}
@@ -97,8 +97,12 @@ def check(exe, baseline, spikes, report):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, required=True)
-    parser.add_argument("--baseline", type=Path, required=True)
+    parser.add_argument("--backend", choices=("auto", "nalgebra", "lapack"), default="nalgebra")
+    parser.add_argument("--lapack-library", type=Path)
     parser.add_argument("--spikes", type=int, default=9_000_000)
     parser.add_argument("--report", type=Path, default=Path("large-recording.json"))
     args = parser.parse_args()
-    check(args.exe.resolve(), args.baseline.resolve(), args.spikes, args.report.resolve())
+    extra_args = ["--backend", args.backend]
+    if args.lapack_library:
+        extra_args += ["--lapack-library", str(args.lapack_library.resolve())]
+    check(args.exe.resolve(), args.spikes, args.report.resolve(), extra_args)

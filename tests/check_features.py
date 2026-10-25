@@ -33,7 +33,7 @@ def run(exe, tetrode, root, components, ok=True, extra_args=()):
     return rows
 
 
-def check(exe, baseline, extra_args=()):
+def check(exe, extra_args=()):
     with tempfile.TemporaryDirectory(prefix="prekk test ") as directory:
         root = Path(directory)
         tetrode = root / "input with spaces.1"
@@ -77,11 +77,6 @@ def check(exe, baseline, extra_args=()):
                                 dot = sum(a * b for a, b in zip(column, previous))
                                 scale = math.sqrt(sum(x*x for x in column) * sum(x*x for x in previous))
                                 require(abs(dot) / scale < 1e-5, "PCA orthogonality")
-                if baseline:
-                    expected = run(baseline, tetrode, root, components)
-                    require(all(math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-4)
-                                for row, old in zip(rows, expected) for a, b in zip(row, old)),
-                            "Features changed from baseline")
         for count, message in ((-1, "at least 2"), (0, "at least 2"),
                                (9000000, "shorter"), (10000000, "shorter"),
                                (2147483648, "2147483647")):
@@ -91,14 +86,14 @@ def check(exe, baseline, extra_args=()):
                         b"data_start", b"not a tetrode file"):
             tetrode.write_bytes(content)
             run(exe, tetrode, root, "3PC", ok=False, extra_args=extra_args)
-    print("Feature and input checks passed" + ("; baseline outputs match" if baseline else ""))
+    print("Feature mathematics and input checks passed")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", required=True, type=Path)
-    parser.add_argument("--baseline", type=Path)
-    parser.add_argument("--backend", choices=("nalgebra", "lapack"))
+    parser.add_argument("--backend", choices=("auto", "nalgebra", "lapack"))
+    parser.add_argument("--lapack-library", type=Path)
     parser.add_argument("--block-spikes", type=int)
     args = parser.parse_args()
     extra_args = []
@@ -106,4 +101,6 @@ if __name__ == "__main__":
         extra_args += ["--backend", args.backend]
     if args.block_spikes:
         extra_args += ["--block-spikes", str(args.block_spikes)]
-    check(args.exe.resolve(), args.baseline.resolve() if args.baseline else None, extra_args)
+    if args.lapack_library:
+        extra_args += ["--lapack-library", str(args.lapack_library.resolve())]
+    check(args.exe.resolve(), extra_args)

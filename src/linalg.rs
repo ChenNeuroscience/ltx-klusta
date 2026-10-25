@@ -1,173 +1,90 @@
-use crate::{Error, Result, SAMPLES};
+use crate::{native::NativeLapack, Error, Result, SAMPLES};
 use nalgebra::{linalg::SymmetricEigen, DMatrix};
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum Backend {
-    #[cfg_attr(not(feature = "lapack"), default)]
-    Nalgebra,
-    #[cfg(feature = "lapack")]
+    /// Detect a compatible native provider, otherwise use nalgebra
+    Auto,
+    /// Use pure Rust numerical routines
     #[default]
+    Nalgebra,
+    /// Require a compatible LP64 BLAS/LAPACK provider
     Lapack,
 }
 
-impl Backend {
-    pub fn parse(name: &str) -> Result<Self> {
-        match name {
-            "nalgebra" => Ok(Self::Nalgebra),
-            #[cfg(feature = "lapack")]
-            "lapack" => Ok(Self::Lapack),
-            #[cfg(not(feature = "lapack"))]
-            "lapack" => Err(Error::Invalid(
-                "This executable has no LAPACK support; use the LAPACK build",
-            )),
-            _ => Err(Error::Invalid("Backend must be nalgebra or lapack")),
+pub(crate) struct Engine {
+    native: Option<NativeLapack>,
+}
+
+impl Engine {
+    pub(crate) fn resolve(choice: Backend, library: Option<&Path>) -> Result<Self> {
+        if choice == Backend::Nalgebra {
+            if library.is_some() {
+                return Err(Error::Invalid(
+                    "A LAPACK library cannot be used with the nalgebra backend",
+                ));
+            }
+            return Ok(Self { native: None });
+        }
+        match NativeLapack::discover(library) {
+            Ok(native) => Ok(Self {
+                native: Some(native),
+            }),
+            Err(_) if choice == Backend::Auto && library.is_none() => Ok(Self { native: None }),
+            Err(error) => Err(error),
         }
     }
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Nalgebra => "nalgebra",
-            #[cfg(feature = "lapack")]
-            Self::Lapack => "lapack",
+    pub(crate) fn description(&self) -> String {
+        match &self.native {
+            Some(native) => format!("lapack ({})", native.path.display()),
+            None => "nalgebra".into(),
         }
     }
 
-    // All matrices are column-major. Only the lower triangle is accumulated.
-    pub(crate) fn accumulate(self, data: &[f64], count: usize, moments: &mut DMatrix<f64>) {
+    pub(crate) fn accumulate(&self, data: &[f64], count: usize, moments: &mut DMatrix<f64>) {
         debug_assert_eq!(data.len(), SAMPLES * count);
-        match self {
-            Self::Nalgebra => {
-                let x = nalgebra::DMatrixView::from_slice(data, SAMPLES, count);
-                let product = x * x.transpose();
-                for column in 0..SAMPLES {
-                    for row in column..SAMPLES {
-                        moments[(row, column)] += product[(row, column)];
-                    }
-                }
-            }
-            #[cfg(feature = "lapack")]
-            Self::Lapack => {
-                // SAFETY: both arrays are sized for the stated column-major shapes;
-                // count is bounded by MAX_BLOCK_SPIKES and the ABI uses 32-bit ints.
-                unsafe {
-                    blas::dsyrk(
-                        b'L',
-                        b'N',
-                        SAMPLES as i32,
-                        count as i32,
-                        1.0,
-                        data,
-                        SAMPLES as i32,
-                        1.0,
-                        moments.as_mut_slice(),
-                        SAMPLES as i32,
-                    );
+        if let Some(native) = &self.native {
+            native.accumulate(data, count, moments);
+        } else {
+            let x = nalgebra::DMatrixView::from_slice(data, SAMPLES, count);
+            let product = x * x.transpose();
+            for column in 0..SAMPLES {
+                for row in column..SAMPLES {
+                    moments[(row, column)] += product[(row, column)];
                 }
             }
         }
     }
 
-    pub(crate) fn eigen(self, covariance: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
-        match self {
-            Self::Nalgebra => {
-                let eigen = SymmetricEigen::try_new(covariance, f64::EPSILON, 100_000)
-                    .ok_or(Error::Invalid("PCA eigensolver did not converge"))?;
-                Ok((eigen.eigenvalues.as_slice().to_vec(), eigen.eigenvectors))
-            }
-            #[cfg(feature = "lapack")]
-            Self::Lapack => lapack_eigen(covariance),
+    pub(crate) fn eigen(&self, covariance: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
+        if let Some(native) = &self.native {
+            native.eigen(covariance)
+        } else {
+            let eigen = SymmetricEigen::try_new(covariance, f64::EPSILON, 100_000)
+                .ok_or(Error::Invalid("PCA eigensolver did not converge"))?;
+            Ok((eigen.eigenvalues.as_slice().to_vec(), eigen.eigenvectors))
         }
     }
-}
-
-impl std::fmt::Display for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-#[cfg(feature = "lapack")]
-fn lapack_eigen(mut matrix: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
-    // Both routines overwrite A, including on failure. Preserve the covariance
-    // for the same DSYEVD -> DSYEV convergence fallback as Armadillo.
-    let original = matrix.clone();
-    let n = SAMPLES as i32;
-    let mut values = vec![0.0; SAMPLES];
-    // Match the working C++ reference: use the upper triangle and its
-    // conservative workspace sizes, rather than the documented minima.
-    // This also keeps the older bundled Windows LAPACK on the same code path.
-    let mut work = vec![0.0; 2 * (1 + 6 * SAMPLES + 2 * SAMPLES * SAMPLES)];
-    let mut iwork = vec![0; 3 * (3 + 5 * SAMPLES)];
-    let (lwork, liwork) = (work.len() as i32, iwork.len() as i32);
-    let mut info = 0;
-    // SAFETY: the 50x50 matrix, eigenvalues, and documented workspaces above
-    // have the required sizes. Bundled Windows LAPACK and Accelerate use LP64.
-    unsafe {
-        lapack::dsyevd(
-            b'V',
-            b'U',
-            n,
-            matrix.as_mut_slice(),
-            n,
-            &mut values,
-            &mut work,
-            lwork,
-            &mut iwork,
-            liwork,
-            &mut info,
-        );
-    }
-    if info > 0 {
-        return lapack_qr(original);
-    }
-    if info < 0 {
-        return Err(Error::Lapack {
-            routine: "DSYEVD",
-            info,
-        });
-    }
-    Ok((values, matrix))
-}
-
-#[cfg(feature = "lapack")]
-fn lapack_qr(mut matrix: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
-    let n = SAMPLES as i32;
-    let mut values = vec![0.0; SAMPLES];
-    let mut work = vec![0.0; 3 * (3 * SAMPLES - 1)];
-    let lwork = work.len() as i32;
-    let mut info = 0;
-    // SAFETY: A is column-major 50x50, W has 50 elements, and WORK exceeds
-    // DSYEV's documented 3*N-1 minimum. The ABI matches the DSYEVD call above.
-    unsafe {
-        lapack::dsyev(
-            b'V',
-            b'U',
-            n,
-            matrix.as_mut_slice(),
-            n,
-            &mut values,
-            &mut work,
-            lwork,
-            &mut info,
-        );
-    }
-    if info != 0 {
-        return Err(Error::Lapack {
-            routine: "DSYEV",
-            info,
-        });
-    }
-    Ok((values, matrix))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn backends() -> Vec<Backend> {
-        let mut values = vec![Backend::Nalgebra];
-        if let Ok(lapack) = Backend::parse("lapack") {
-            values.push(lapack);
+    fn engines() -> Vec<Engine> {
+        let mut values = vec![Engine::resolve(Backend::Nalgebra, None).unwrap()];
+        let native = Engine::resolve(Backend::Lapack, None);
+        if std::env::var_os("PREKK_REQUIRE_LAPACK").is_some() {
+            assert!(
+                native.is_ok(),
+                "CI requires LAPACK: {}",
+                native.err().map(|e| e.to_string()).unwrap_or_default()
+            );
+            values.push(Engine::resolve(Backend::Lapack, None).unwrap());
+        } else if let Ok(native) = native {
+            values.push(native);
         }
         values
     }
@@ -178,25 +95,29 @@ mod tests {
         let data: Vec<_> = (0..count * SAMPLES)
             .map(|i| ((i * 31 % 199) as i32 - 99) as f64)
             .collect();
-        for backend in backends() {
+        for engine in engines() {
             let mut actual = DMatrix::zeros(SAMPLES, SAMPLES);
-            backend.accumulate(&data, count, &mut actual);
-            backend.accumulate(&data, count, &mut actual);
+            engine.accumulate(&data, count, &mut actual);
+            engine.accumulate(&data, count, &mut actual);
             for column in 0..SAMPLES {
                 for row in column..SAMPLES {
                     let expected = 2.0
                         * (0..count)
                             .map(|i| data[i * SAMPLES + row] * data[i * SAMPLES + column])
                             .sum::<f64>();
-                    assert_eq!(
-                        actual[(row, column)],
-                        expected,
-                        "{} at ({row}, {column})",
-                        backend.name()
-                    );
+                    assert_eq!(actual[(row, column)], expected, "{}", engine.description());
                 }
             }
         }
+    }
+
+    fn assert_eigenpairs(matrix: &DMatrix<f64>, values: Vec<f64>, vectors: DMatrix<f64>) {
+        let residual = matrix * &vectors
+            - &vectors * DMatrix::from_diagonal(&nalgebra::DVector::from_vec(values));
+        assert!(residual.norm() / matrix.norm() < 1e-12);
+        assert!(
+            (vectors.transpose() * vectors - DMatrix::identity(SAMPLES, SAMPLES)).norm() < 1e-12
+        );
     }
 
     #[test]
@@ -209,29 +130,16 @@ mod tests {
             })
             .collect();
         let mut lower = DMatrix::zeros(SAMPLES, SAMPLES);
-        Backend::Nalgebra.accumulate(&data, 80, &mut lower);
+        engines()[0].accumulate(&data, 80, &mut lower);
         let matrix = DMatrix::from_fn(SAMPLES, SAMPLES, |row, column| {
             lower[(row.max(column), row.min(column))]
         });
-        for backend in backends() {
-            let (values, vectors) = backend.eigen(matrix.clone()).unwrap();
-            let residual = &matrix * &vectors
-                - &vectors * DMatrix::from_diagonal(&nalgebra::DVector::from_vec(values));
-            assert!(
-                residual.norm() / matrix.norm() < 1e-12,
-                "{} eigen residual",
-                backend.name()
-            );
-            assert!(
-                (vectors.transpose() * vectors - DMatrix::identity(SAMPLES, SAMPLES)).norm()
-                    < 1e-12,
-                "{} eigenvector orthogonality",
-                backend.name()
-            );
+        for engine in engines() {
+            let (values, vectors) = engine.eigen(matrix.clone()).unwrap();
+            assert_eigenpairs(&matrix, values, vectors);
         }
     }
 
-    #[cfg(feature = "lapack")]
     #[test]
     fn qr_fallback_has_correct_eigenpairs() {
         let matrix = DMatrix::from_fn(SAMPLES, SAMPLES, |row, column| {
@@ -243,12 +151,48 @@ mod tests {
                 0.0
             }
         });
-        let (values, vectors) = lapack_qr(matrix.clone()).unwrap();
-        let residual = &matrix * &vectors
-            - &vectors * DMatrix::from_diagonal(&nalgebra::DVector::from_vec(values));
-        assert!(residual.norm() / matrix.norm() < 1e-12);
-        assert!(
-            (vectors.transpose() * vectors - DMatrix::identity(SAMPLES, SAMPLES)).norm() < 1e-12
-        );
+        for engine in engines() {
+            if let Some(native) = engine.native {
+                let (values, vectors) = native.qr(matrix.clone()).unwrap();
+                assert_eigenpairs(&matrix, values, vectors);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_missing_library_is_an_error() {
+        let missing = Path::new("prekk-provider-that-does-not-exist");
+        assert!(Engine::resolve(Backend::Lapack, Some(missing)).is_err());
+        assert!(Engine::resolve(Backend::Auto, Some(missing)).is_err());
+        assert!(Engine::resolve(Backend::Nalgebra, Some(missing)).is_err());
+    }
+
+    #[test]
+    #[ignore = "manual performance measurement; never part of routine CI"]
+    fn covariance_block_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        println!("backend,block_spikes,input_mib,million_spikes_per_second");
+        for engine in engines() {
+            for block in [512, 2048, 4096, 8192, 16384] {
+                let data: Vec<_> = (0..SAMPLES * block)
+                    .map(|i| ((i * 31 % 199) as i32 - 99) as f64)
+                    .collect();
+                let mut moments = DMatrix::zeros(SAMPLES, SAMPLES);
+                engine.accumulate(&data, block, &mut moments);
+                let iterations = 1_310_720 / block;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    engine.accumulate(black_box(&data), block, black_box(&mut moments));
+                }
+                let seconds = started.elapsed().as_secs_f64();
+                println!(
+                    "{},{},{:.3},{:.3}",
+                    engine.description().split_whitespace().next().unwrap(),
+                    block,
+                    data.len() as f64 * 8.0 / 1048576.0,
+                    (iterations * block) as f64 / seconds / 1e6
+                );
+            }
+        }
     }
 }

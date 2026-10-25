@@ -1,7 +1,4 @@
-Debug
-Release
-build/
 dist/
 target/
-build-legacy/
+native-test/
 __pycache__/

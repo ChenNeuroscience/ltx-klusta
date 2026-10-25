@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    after_help = "EXAMPLES:\n  prekk recording.1 temp/recording temp/count.txt 3PC\n  prekk recording.1 temp/recording temp/count.txt 3PC,A,VT --block-spikes 8192\n  prekk --completions powershell\n\nOutput columns follow legacy order: all active channels' PCs, then amplitudes, then VT."
+    after_help = "EXAMPLES:\n  prekk recording.1 temp/recording temp/count.txt 3PC\n  prekk recording.1 temp/recording temp/count.txt 3PC,A,VT --backend auto\n  prekk recording.1 temp/recording temp/count.txt 3PC --lapack-library PATH\n  prekk --completions powershell\n\nOutput columns: all active channels' PCs, then amplitudes, then VT."
 )]
 struct Cli {
     /// Input tetrode recording, including its numeric extension
@@ -22,9 +22,12 @@ struct Cli {
     /// Comma-separated features, e.g. 3PC, 3PC,A,VT, or A,VT
     #[arg(required = true, value_parser = Features::parse)]
     features: Option<Features>,
-    /// Numerical implementation for covariance accumulation and PCA
-    #[arg(long, value_enum, default_value_t = Backend::default())]
-    backend: Backend,
+    /// Numerical backend (default: nalgebra; a library path selects lapack)
+    #[arg(long, value_enum)]
+    backend: Option<Backend>,
+    /// Optional LP64 BLAS/LAPACK library to load at runtime
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    lapack_library: Option<PathBuf>,
     /// Maximum spikes held in one processing block
     #[arg(long, default_value_t = DEFAULT_BLOCK_SPIKES as u32,
           value_parser = clap::value_parser!(u32).range(1..=MAX_BLOCK_SPIKES as i64))]
@@ -41,12 +44,26 @@ fn main() {
         return;
     }
     // clap enforces all four positionals unless completions were requested.
+    let backend = cli.backend.unwrap_or(if cli.lapack_library.is_some() {
+        Backend::Lapack
+    } else {
+        Backend::Nalgebra
+    });
+    if backend == Backend::Nalgebra && cli.lapack_library.is_some() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--lapack-library cannot be used with --backend nalgebra",
+            )
+            .exit();
+    }
     let options = Options {
         input: cli.input.unwrap(),
         output_base: cli.output_base.unwrap(),
         info: cli.spike_count_file.unwrap(),
         features: cli.features.unwrap(),
-        backend: cli.backend,
+        backend,
+        lapack_library: cli.lapack_library,
         block_spikes: cli.block_spikes as usize,
     };
     match prekk::extract(&options) {
