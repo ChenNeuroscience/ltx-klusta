@@ -1,7 +1,7 @@
 //! Disk-backed features. Only the fitting subset lives in memory.
 use crate::{Error, Result, MAX_SPIKES};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -129,12 +129,17 @@ impl FeatureStore {
         let mut raw = vec![0; self.columns * 4];
         let mut row = Vec::with_capacity(self.dims());
         let mut values = Vec::with_capacity(indices.len() * self.dims());
+        let mut position = 0_u64;
         for &index in indices {
             if index >= self.points {
                 return Err(Error::Invalid("Fitting index outside recording"));
             }
-            input.seek(SeekFrom::Start((index * raw.len()) as u64))?;
+            let requested = (index * raw.len()) as u64;
+            // Keep nearby selected rows in the existing read buffer. seek()
+            // discards it even when the requested row is already buffered.
+            input.seek_relative(requested as i64 - position as i64)?;
             input.read_exact(&mut raw)?;
+            position = requested + raw.len() as u64;
             self.normalize(&raw, &mut row);
             values.extend_from_slice(&row);
         }
@@ -167,6 +172,27 @@ impl FeatureStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_rows_cross_buffers_and_allow_repeated_or_backward_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.fet.1");
+        let points = 140_000;
+        let mut writer = BufWriter::new(File::create(&path).unwrap());
+        writeln!(writer, "2").unwrap();
+        for i in 0..points {
+            writeln!(writer, "{i} {}", i * 2).unwrap();
+        }
+        writer.flush().unwrap();
+        let store = FeatureStore::create(&path, &dir.path().join("cache")).unwrap();
+        let indices = [0, 1, 131_071, 131_072, 139_999, 17, 17, 131_072];
+        let data = store.load_indices(&indices).unwrap();
+        for (row, index) in indices.into_iter().enumerate() {
+            let expected = index as f64 / (points - 1) as f64;
+            assert_eq!(data.row(row), &[expected, expected]);
+        }
+        assert!(store.load_indices(&[points]).is_err());
+    }
+
     #[test]
     fn normalization_uses_full_bounds_and_removes_constant_columns() {
         let dir = tempfile::tempdir().unwrap();

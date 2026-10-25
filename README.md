@@ -1,34 +1,38 @@
-# fancykk
+# ltx-klusta
 
-Rust feature extraction and classic KlustaKwik clustering for Axona tetrode
+LTX stands for **legacy tetrode x**. The command is **`ltxk`**.
+
+Rust feature extraction and classic KlustaKwik clustering for legacy tetrode
 recordings. This combines the old `prekk.exe`, `KlustaKwik.exe`, and `runkk.bat`
-workflow into one executable: `fancykk.exe` on Windows x64 or `fancykk` on macOS
+workflow into one executable: `ltxk.exe` on Windows x64 or `ltxk` on macOS
 Apple Silicon. No numerical DLLs are required. LAPACK is an optional runtime
 provider for PCA.
 
 The clustering port is ready for evaluation on representative recordings.
 See [CLUSTERING.md](CLUSTERING.md) for the exact supported algorithm, numerical
 compatibility, memory/storage requirements, and validation performed so far.
+See [PERFORMANCE.md](PERFORMANCE.md) for profiling and optimisations that retain
+the current calculations.
 
-## Sort recordings
+## Cluster recordings
 
 ```sh
-fancykk sort recording.1
-fancykk sort recording.1 recording.2 --backend auto
-fancykk sort recording.1 --force
-fancykk --help
-fancykk sort --help
-fancykk --completions powershell
+ltxk cluster recording.1
+ltxk cluster recording.1 recording.2 --backend auto
+ltxk cluster recording.1 --force
+ltxk --help
+ltxk cluster --help
+ltxk --completions powershell
 ```
 
 Drag recordings onto the Windows executable or a shortcut to it to run the
-same sorting operation with default settings. Paths may contain spaces,
+same clustering operation with default settings. Paths may contain spaces,
 Unicode, and punctuation. Results are written beside each input:
 `recording.1` becomes `recording.clu.1`. Existing results are skipped unless
 `--force` is given. A failed job leaves any previous output intact; new output
 is published atomically after it is complete.
 
-Defaults match the supplied fancykk batch file: `3PC`, classic unmasked
+Defaults match the original fancykk batch file: `3PC`, classic unmasked
 clustering, initial cluster counts 20–30, seed 1, a 25,000-spike fitting target,
 and four simultaneous recordings. PCA uses every spike. Clustering fits a
 stratified subset for large recordings and assigns **all** spikes using the
@@ -42,10 +46,10 @@ Use the persistent per-user queue when jobs arrive through separate Explorer
 invocations:
 
 ```sh
-fancykk enqueue recording.1 recording.2 --background
-fancykk status
-fancykk status --json
-fancykk resume
+ltxk enqueue recording.1 recording.2 --background
+ltxk status
+ltxk status --json
+ltxk resume
 ```
 
 `enqueue` without `--background` participates in the queue in the foreground.
@@ -60,13 +64,13 @@ After a coordinator is interrupted, `resume` or another `enqueue` recovers its
 running jobs and clears their old private scratch files before retrying them.
 Queue history and logs remain available through `status`.
 
-The default queue is `%LOCALAPPDATA%\fancykk\queue` on Windows and
-`~/Library/Application Support/fancykk/queue` on macOS. `--queue-dir PATH`
+The default queue is `%LOCALAPPDATA%\ltxk\queue` on Windows and
+`~/Library/Application Support/ltxk/queue` on macOS. `--queue-dir PATH`
 overrides it on `enqueue`, `status`, and `resume`.
 
 ## Configuration
 
-Copy `fancykk.example.json` to `fancykk.json` beside the executable to customize
+Copy `ltxk.example.json` to `ltxk.json` beside the executable to customize
 the same settings previously edited at the top of the batch file:
 
 ```json
@@ -102,8 +106,8 @@ under the queue folder. The fitting target may be reduced with
 The former prekk operation is available as a subcommand:
 
 ```sh
-fancykk features recording.1 temporary/recording temporary/count.txt 3PC
-fancykk features recording.1 temporary/recording temporary/count.txt 3PC,A,VT --backend auto
+ltxk features recording.1 temporary/recording temporary/count.txt 3PC
+ltxk features recording.1 temporary/recording temporary/count.txt 3PC,A,VT --backend auto
 ```
 
 Create the output directories first. This writes `OUTPUT_BASE.fet.N` and a
@@ -113,7 +117,7 @@ active channels' PCs, then all amplitudes, then all VT values. Constant channels
 are omitted. Values have six significant digits in scientific notation.
 
 The old four-argument top-level invocation has moved to `features`; the old
-batch file should be replaced with the combined `sort` or `enqueue` operation.
+batch file should be replaced with the combined `cluster` or `enqueue` operation.
 
 ## Numerical backend
 
@@ -126,7 +130,7 @@ batch file should be replaced with the combined `sort` or `enqueue` operation.
 
 An explicit library path must work, including in `auto` mode. It cannot be
 combined with `--backend nalgebra`. The selected provider is logged.
-`FANCYKK_LAPACK_LIBRARY` supplies a preferred discovery path.
+`LTXK_LAPACK_LIBRARY` supplies a preferred discovery path.
 
 macOS discovery includes the system Accelerate framework. Windows searches
 beside the executable and on PATH for LP64 OpenBLAS/LAPACK providers, including
@@ -156,13 +160,13 @@ and seed when reproducibility matters.
 The old registry command appears under **Show more options**. A command in the
 first Windows 11 menu requires an `IExplorerCommand` COM extension and package
 identity, normally supplied by an optional signed sparse MSIX package. This is
-an installed integration component; the portable sorting executable remains
+an installed integration component; the portable clustering executable remains
 independent. See [Microsoft's integration guide](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/integrate-packaged-app-with-file-explorer).
 
 This branch provides the safe multi-file queue command that an extension can
 invoke, but does not yet install a modern Explorer extension. Such an extension
 should filter numeric recording extensions, enumerate the selection, and call
-`fancykk enqueue --background` with individual paths, without a command shell.
+`ltxk enqueue --background` with individual paths, without a command shell.
 It must keep menu construction fast and leave processing to the queue.
 GitHub's Windows runner can test its COM and package behaviour, but visual menu
 placement still needs a Windows 11 desktop check.
@@ -177,9 +181,9 @@ cargo build --release --locked
 cargo test --release --locked
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-python3 tests/check_features.py --exe target/release/fancykk
-python3 tests/check_rust.py --exe target/release/fancykk
-python3 tests/check_sort.py --exe target/release/fancykk
+python3 tests/check_features.py --exe target/release/ltxk
+python3 tests/check_rust.py --exe target/release/ltxk
+python3 tests/check_cluster.py --exe target/release/ltxk
 ```
 
 Use a current stable Rust toolchain. Windows executables have the `.exe` suffix
@@ -191,7 +195,7 @@ available disk capacity at its upper extreme.
 
 The `Build` workflow builds and tests the packaged executable on Windows x64
 and macOS Apple Silicon with both numerical backends. It checks PCA mathematics,
-CLI/completions, full sorting and subsets, output safety, shared queue failures
+CLI/completions, full clustering and subsets, output safety, shared queue failures
 and crash recovery, and execution without installed numerical libraries.
 Windows CI downloads a checksum-pinned OpenBLAS provider for tests only.
 
@@ -203,5 +207,5 @@ Successful main builds publish [GitHub releases](https://github.com/ChenNeurosci
 tagged with the source commit ID. Each platform has one ZIP plus its checksum.
 Packages include the executable, documentation, example settings, build
 metadata, dependency notices, and file checksums. PR builds provide test
-artifacts. For a macOS Actions artifact, run `chmod +x fancykk` after extracting;
+artifacts. For a macOS Actions artifact, run `chmod +x ltxk` after extracting;
 release ZIPs preserve the executable permission automatically.

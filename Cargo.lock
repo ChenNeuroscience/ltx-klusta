@@ -151,19 +151,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fancykk"
-version = "0.1.0"
-dependencies = [
- "clap",
- "clap_complete",
- "libloading",
- "nalgebra",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -243,6 +230,19 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "ltx-klusta"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "libloading",
+ "nalgebra",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "matrixmultiply"

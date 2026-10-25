@@ -62,18 +62,18 @@ impl Queue {
                 std::env::var_os("LOCALAPPDATA")
                     .ok_or(Error::Invalid("LOCALAPPDATA is not set"))?,
             )
-            .join("fancykk/queue"))
+            .join("ltxk/queue"))
         } else if cfg!(target_os = "macos") {
             Ok(
                 PathBuf::from(std::env::var_os("HOME").ok_or(Error::Invalid("HOME is not set"))?)
-                    .join("Library/Application Support/fancykk/queue"),
+                    .join("Library/Application Support/ltxk/queue"),
             )
         } else if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-            Ok(PathBuf::from(path).join("fancykk/queue"))
+            Ok(PathBuf::from(path).join("ltxk/queue"))
         } else {
             Ok(
                 PathBuf::from(std::env::var_os("HOME").ok_or(Error::Invalid("HOME is not set"))?)
-                    .join(".local/state/fancykk/queue"),
+                    .join(".local/state/ltxk/queue"),
             )
         }
     }
@@ -201,7 +201,7 @@ impl Queue {
             match coordinator.try_lock() {
                 Ok(()) => (),
                 Err(TryLockError::WouldBlock) => {
-                    writeln!(log, "An existing coordinator will process these jobs. Use fancykk status to check progress.")?;
+                    writeln!(log, "An existing coordinator will process these jobs. Use ltxk status to check progress.")?;
                     return Ok(false);
                 }
                 Err(TryLockError::Error(error)) => return Err(error.into()),
@@ -286,7 +286,7 @@ impl Queue {
                 })?;
                 let mut log =
                     File::create(queue.root.join("logs").join(format!("{}.log", job.id)))?;
-                pipeline::sort_in(&job.input, &job.settings, &work, &mut log)
+                pipeline::cluster_in(&job.input, &job.settings, &work, &mut log)
             },
         ));
         let outcome = outcome.unwrap_or(Err(Error::Invalid(
@@ -294,7 +294,7 @@ impl Queue {
         )));
         if work.exists() {
             if let Err(error) = fs::remove_dir_all(&work) {
-                eprintln!("fancykk: scratch cleanup {}: {error}", work.display());
+                eprintln!("ltxk: scratch cleanup {}: {error}", work.display());
             }
         }
         match outcome {
@@ -304,7 +304,7 @@ impl Queue {
             }
             Err(error) => {
                 let message = error.to_string();
-                eprintln!("fancykk: {}: {message}", job.input.display());
+                eprintln!("ltxk: {}: {message}", job.input.display());
                 let path = queue.root.join("logs").join(format!("{}.log", job.id));
                 if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(path) {
                     let _ = writeln!(log, "FAILED: {message}");

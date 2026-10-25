@@ -37,7 +37,7 @@ def check(exe, spikes, report, extra_args=()):
     for spike in range(250):
         for channel in range(4):
             bank += struct.pack("<I50b", spike, *(rng.randint(-100, 100) + channel for _ in range(50)))
-    with tempfile.TemporaryDirectory(prefix="fancykk scale ") as directory:
+    with tempfile.TemporaryDirectory(prefix="ltxk scale ") as directory:
         root = Path(directory)
         recording = root / "scale.1"
         with recording.open("wb") as output:

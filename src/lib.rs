@@ -1,7 +1,7 @@
 //! Two-pass feature extraction with memory bounded by block size, not spike count.
 
 #[cfg(not(target_pointer_width = "64"))]
-compile_error!("fancykk requires a 64-bit target");
+compile_error!("ltxk requires a 64-bit target");
 
 pub mod cluster;
 pub mod feature_store;

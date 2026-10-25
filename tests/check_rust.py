@@ -28,7 +28,7 @@ def check(exe, extra_args=()):
         require(result.returncode == 0 and result.stdout, f"CLI {flag} failed: {result.stderr}")
     for shell in ("bash", "zsh", "fish", "powershell", "elvish"):
         result = command(exe, "--completions", shell)
-        require(result.returncode == 0 and "fancykk" in result.stdout, result.stderr)
+        require(result.returncode == 0 and "ltxk" in result.stdout, result.stderr)
     require(command(exe).returncode == 2, "Missing arguments should be a CLI error")
     positional = ["features", "x.1", "out", "count", "3PC"]
     for flags in (("--backend", "typo"), ("--block-spikes", "0"),
@@ -36,7 +36,7 @@ def check(exe, extra_args=()):
                   ("--backend", "nalgebra", "--lapack-library", "x.dll")):
         result = command(exe, *positional, *flags)
         require(result.returncode == 2 and "error:" in result.stderr, "CLI validation failed")
-    with tempfile.TemporaryDirectory(prefix="fancykk rust ") as directory:
+    with tempfile.TemporaryDirectory(prefix="ltxk rust ") as directory:
         root = Path(directory)
         tetrode = root / "data.1"
         rank_one = [[(i - 20) * ((j % 5) - 2) + 4 for j in range(50)] for i in range(41)]

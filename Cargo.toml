@@ -1,9 +1,14 @@
 [package]
-name = "fancykk"
+name = "ltx-klusta"
 version = "0.1.0"
 edition = "2021"
-description = "Feature extraction and classic KlustaKwik clustering for Axona tetrode recordings"
+description = "Feature extraction and classic KlustaKwik clustering for legacy tetrode recordings"
 publish = false
+default-run = "ltxk"
+
+[[bin]]
+name = "ltxk"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

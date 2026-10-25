@@ -87,7 +87,7 @@ mod tests {
     fn engines() -> Vec<Engine> {
         let mut values = vec![Engine::resolve(Backend::Nalgebra, None).unwrap()];
         let native = Engine::resolve(Backend::Lapack, None);
-        if std::env::var_os("FANCYKK_REQUIRE_LAPACK").is_some() {
+        if std::env::var_os("LTXK_REQUIRE_LAPACK").is_some() {
             assert!(
                 native.is_ok(),
                 "CI requires LAPACK: {}",
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn explicit_missing_library_is_an_error() {
-        let missing = Path::new("fancykk-provider-that-does-not-exist");
+        let missing = Path::new("ltxk-provider-that-does-not-exist");
         assert!(Engine::resolve(Backend::Lapack, Some(missing)).is_err());
         assert!(Engine::resolve(Backend::Auto, Some(missing)).is_err());
         assert!(Engine::resolve(Backend::Nalgebra, Some(missing)).is_err());

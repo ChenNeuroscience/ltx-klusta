@@ -1,22 +1,24 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use fancykk::{pipeline, queue::Queue, Backend, Error, Features, Result, MAX_BLOCK_SPIKES};
+use ltx_klusta::{pipeline, queue::Queue, Backend, Error, Features, Result, MAX_BLOCK_SPIKES};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Sort Axona tetrode recordings with PCA and classic KlustaKwik clustering.
+/// Cluster legacy tetrode recordings with PCA and classic KlustaKwik clustering.
 #[derive(Debug, Parser)]
 #[command(
+    name = "ltx-klusta",
+    bin_name = "ltxk",
     version,
     arg_required_else_help = true,
     args_conflicts_with_subcommands = true,
-    after_help = "EXAMPLES:\n  fancykk sort recording.1\n  fancykk sort recording.1 recording.2 --backend auto\n  fancykk enqueue recording.1 --background\n  fancykk status\n  fancykk features recording.1 temp/recording temp/count.txt 3PC\n  fancykk --completions powershell\n\nDropping recordings onto the executable also sorts them with the default configuration."
+    after_help = "EXAMPLES:\n  ltxk cluster recording.1\n  ltxk cluster recording.1 recording.2 --backend auto\n  ltxk enqueue recording.1 --background\n  ltxk status\n  ltxk features recording.1 temp/recording temp/count.txt 3PC\n  ltxk --completions powershell\n\nDropping recordings onto the executable also clusters them with the default configuration."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Recordings to sort using fancykk.json or defaults (drag-and-drop)
+    /// Recordings to cluster using ltxk.json or defaults (drag-and-drop)
     #[arg(value_hint = clap::ValueHint::FilePath)]
     inputs: Vec<PathBuf>,
     /// Write shell completion definitions and exit
@@ -27,18 +29,18 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Extract features, fit clusters, and write .clu.N beside each recording
-    Sort {
+    Cluster {
         #[arg(required = true, num_args = 1.., value_hint = clap::ValueHint::FilePath)]
         inputs: Vec<PathBuf>,
         #[command(flatten)]
-        options: SortOptions,
+        options: ClusterOptions,
     },
     /// Queue recordings across independent invocations (four concurrent jobs by default)
     Enqueue {
         #[arg(required = true, num_args = 1.., value_hint = clap::ValueHint::FilePath)]
         inputs: Vec<PathBuf>,
         #[command(flatten)]
-        options: SortOptions,
+        options: ClusterOptions,
         /// Start a detached coordinator and return immediately
         #[arg(long)]
         background: bool,
@@ -114,8 +116,8 @@ impl Numerical {
 }
 
 #[derive(Debug, Default, Args)]
-struct SortOptions {
-    /// JSON settings file (default: fancykk.json beside the executable, if present)
+struct ClusterOptions {
+    /// JSON settings file (default: ltxk.json beside the executable, if present)
     #[arg(long)]
     config: Option<PathBuf>,
     /// Features supplied to clustering (default: 3PC)
@@ -154,7 +156,7 @@ fn parse_features(text: &str) -> std::result::Result<String, String> {
         .map(|_| text.to_owned())
         .map_err(|error| error.to_string())
 }
-impl SortOptions {
+impl ClusterOptions {
     fn resolve(self) -> Result<pipeline::Settings> {
         let mut settings = pipeline::Settings::load(self.config.as_deref())?;
         if let Some(features) = self.features {
@@ -202,7 +204,7 @@ fn queue(path: Option<PathBuf>) -> Result<Queue> {
     Queue::open(path.map(Ok).unwrap_or_else(Queue::default_path)?)
 }
 
-fn sort_many(inputs: Vec<PathBuf>, settings: pipeline::Settings) -> Result<()> {
+fn cluster_many(inputs: Vec<PathBuf>, settings: pipeline::Settings) -> Result<()> {
     let mut unique = VecDeque::new();
     for input in inputs {
         let input = std::fs::canonicalize(&input).unwrap_or(input);
@@ -221,8 +223,10 @@ fn sort_many(inputs: Vec<PathBuf>, settings: pipeline::Settings) -> Result<()> {
                     let Some(input) = pending.lock().unwrap().pop_front() else {
                         break;
                     };
-                    if let Err(error) = pipeline::sort(&input, &settings, &mut std::io::stderr()) {
-                        eprintln!("fancykk: {}: {error}", input.display());
+                    if let Err(error) =
+                        pipeline::cluster_recording(&input, &settings, &mut std::io::stderr())
+                    {
+                        eprintln!("ltxk: {}: {error}", input.display());
                         failed = true;
                     }
                 }
@@ -246,16 +250,11 @@ fn sort_many(inputs: Vec<PathBuf>, settings: pipeline::Settings) -> Result<()> {
 
 fn run(cli: Cli) -> Result<()> {
     if let Some(shell) = cli.completions {
-        clap_complete::generate(
-            shell,
-            &mut Cli::command(),
-            "fancykk",
-            &mut std::io::stdout(),
-        );
+        clap_complete::generate(shell, &mut Cli::command(), "ltxk", &mut std::io::stdout());
         return Ok(());
     }
     match cli.command {
-        Some(Command::Sort { inputs, options }) => sort_many(inputs, options.resolve()?),
+        Some(Command::Cluster { inputs, options }) => cluster_many(inputs, options.resolve()?),
         Some(Command::Enqueue {
             inputs,
             options,
@@ -271,7 +270,7 @@ fn run(cli: Cli) -> Result<()> {
                 queue.start_background(settings.jobs)?;
             } else if queue.drain(settings.jobs, &mut std::io::stderr())? {
                 return Err(Error::Invalid(
-                    "Some queued jobs failed; use fancykk status for details",
+                    "Some queued jobs failed; use ltxk status for details",
                 ));
             }
             Ok(())
@@ -279,7 +278,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Resume { jobs, queue_dir }) => {
             if queue(queue_dir)?.drain(jobs as usize, &mut std::io::stderr())? {
                 Err(Error::Invalid(
-                    "Some queued jobs failed; use fancykk status for details",
+                    "Some queued jobs failed; use ltxk status for details",
                 ))
             } else {
                 Ok(())
@@ -325,7 +324,7 @@ fn run(cli: Cli) -> Result<()> {
         }) => {
             let mut settings = pipeline::Settings::default();
             numerical.apply(&mut settings);
-            let output = fancykk::extract(&fancykk::Options {
+            let output = ltx_klusta::extract(&ltx_klusta::Options {
                 input,
                 output_base,
                 info: spike_count_file,
@@ -337,13 +336,13 @@ fn run(cli: Cli) -> Result<()> {
             println!("Features written to {}", output.display());
             Ok(())
         }
-        None => sort_many(cli.inputs, SortOptions::default().resolve()?),
+        None => cluster_many(cli.inputs, ClusterOptions::default().resolve()?),
     }
 }
 
 fn main() {
     if let Err(error) = run(Cli::parse()) {
-        eprintln!("fancykk: {error}");
+        eprintln!("ltxk: {error}");
         std::process::exit(1);
     }
 }

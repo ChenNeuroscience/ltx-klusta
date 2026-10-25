@@ -1,5 +1,5 @@
 //! Classic (unmasked) KlustaKwik CEM: full covariance, uniform noise,
-//! BIC deletion, recursive split proposals, and the fancykk subset policy.
+//! BIC deletion, recursive split proposals, and the ltxk subset policy.
 //! Algorithm reference: klusta-team/klustakwik at 9ca1d21 (June 2014).
 use crate::feature_store::{Data, FeatureStore};
 use crate::{Error, Result};
@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub const MAX_CLUSTERS: usize = 100; // Includes the permanent uniform-noise component.
 
@@ -116,6 +117,31 @@ impl Gaussian {
     }
 
     fn score(&self, point: &[f64], root: &mut [f64]) -> f64 {
+        match self.mean.len() {
+            3 => self.score_fixed::<3>(point, root),
+            12 => self.score_fixed::<12>(point, root),
+            _ => self.score_dynamic(point, root),
+        }
+    }
+
+    // Common 3PC dimensions let LLVM remove loop bounds and unroll the
+    // triangular solve. Keep the dynamic path's arithmetic order unchanged.
+    fn score_fixed<const D: usize>(&self, point: &[f64], root: &mut [f64]) -> f64 {
+        let mean: &[f64; D] = self.mean.as_slice().try_into().unwrap();
+        let lower: &[[f64; D]; D] = self.lower.as_chunks::<D>().0.try_into().unwrap();
+        let point: &[f64; D] = point.try_into().unwrap();
+        let root: &mut [f64; D] = root.try_into().unwrap();
+        for i in 0..D {
+            let mut value = point[i] - mean[i];
+            for (j, &previous) in root[..i].iter().enumerate() {
+                value -= lower[i][j] * previous;
+            }
+            root[i] = value / lower[i][i];
+        }
+        root.iter().map(|x| x * x).sum::<f64>() / 2.0 + self.offset
+    }
+
+    fn score_dynamic(&self, point: &[f64], root: &mut [f64]) -> f64 {
         let dims = self.mean.len();
         for i in 0..dims {
             let mut value = point[i] - self.mean[i];
@@ -156,6 +182,19 @@ struct State {
     cov: Vec<f64>,
     scores: Vec<f64>,
 }
+
+fn accumulate_cov_fixed<const D: usize>(point: &[f64], mean: &[f64], cov: &mut [f64]) {
+    let point: &[f64; D] = point.try_into().unwrap();
+    let mean: &[f64; D] = mean.try_into().unwrap();
+    let cov: &mut [[f64; D]; D] = cov.as_chunks_mut::<D>().0.try_into().unwrap();
+    let delta: [f64; D] = std::array::from_fn(|i| point[i] - mean[i]);
+    for i in 0..D {
+        for j in i..D {
+            cov[i][j] += delta[i] * delta[j];
+        }
+    }
+}
+
 impl State {
     fn new(data: Arc<Data>) -> Self {
         let (n, d) = (data.points, data.dims);
@@ -205,8 +244,11 @@ impl State {
             self.weight[c] = (counts[c] + usize::from(c == 0)) as f64 / (n + 1) as f64;
         }
         for (p, &c) in self.class.iter().enumerate() {
-            for (i, &value) in self.data.row(p).iter().enumerate() {
-                self.mean[c * d + i] += value;
+            for (sum, &value) in self.mean[c * d..(c + 1) * d]
+                .iter_mut()
+                .zip(self.data.row(p))
+            {
+                *sum += value;
             }
         }
         for &c in &ids {
@@ -221,13 +263,21 @@ impl State {
             if c == 0 || !self.alive[c] {
                 continue;
             }
-            for (i, value) in delta.iter_mut().enumerate() {
-                *value = self.data.row(p)[i] - self.mean[c * d + i];
-            }
+            let point = self.data.row(p);
+            let mean = &self.mean[c * d..(c + 1) * d];
             let cov = &mut self.cov[c * d * d..(c + 1) * d * d];
-            for i in 0..d {
-                for j in i..d {
-                    cov[i * d + j] += delta[i] * delta[j];
+            match d {
+                3 => accumulate_cov_fixed::<3>(point, mean, cov),
+                12 => accumulate_cov_fixed::<12>(point, mean, cov),
+                _ => {
+                    for ((value, &sample), &center) in delta.iter_mut().zip(point).zip(mean) {
+                        *value = sample - center;
+                    }
+                    for i in 0..d {
+                        for j in i..d {
+                            cov[i * d + j] += delta[i] * delta[j];
+                        }
+                    }
                 }
             }
         }
@@ -350,8 +400,9 @@ impl State {
     ) -> Result<f64> {
         let mut score = f64::INFINITY;
         let mut full = true;
+        let mut previous = vec![0; self.class.len()];
         for iteration in 1..=options.max_iterations {
-            let previous = self.class.clone();
+            previous.copy_from_slice(&self.class);
             self.m_step();
             self.e_step(full);
             if !self.c_step(noise) {
@@ -480,7 +531,9 @@ pub fn run(
     let mut random = Random(options.seed);
     let mut best: Option<Output> = None;
     let mut root = vec![0.; store.dims()];
+    let profile = std::env::var_os("LTXK_PROFILE").is_some();
     for starting in options.min_clusters..=options.max_clusters {
+        let started = Instant::now();
         let indices: Vec<_> = (0..fitting_spikes)
             .map(|i| {
                 if stride == 1 {
@@ -491,6 +544,7 @@ pub fn run(
             })
             .collect();
         let data = Arc::new(store.load_indices(&indices)?);
+        let loaded = Instant::now();
         let mut state = State::new(data);
         let fitted_score = if store.dims() == 0 {
             state.alive[0] = true;
@@ -501,6 +555,7 @@ pub fn run(
             state.initialize(starting, &mut random);
             state.cem(options, &mut random, true, true)?
         };
+        let fitted = Instant::now();
         let model = state.model();
         let candidate = work.join("candidate.labels");
         let mut labels = BufWriter::with_capacity(1 << 20, File::create(&candidate)?);
@@ -523,6 +578,15 @@ pub fn run(
         }
         labels.flush()?;
         drop(labels);
+        if profile {
+            writeln!(
+                log,
+                "Profile trial={starting} load_s={:.6} fit_s={:.6} assign_s={:.6}",
+                (loaded - started).as_secs_f64(),
+                (fitted - loaded).as_secs_f64(),
+                fitted.elapsed().as_secs_f64()
+            )?;
+        }
         if !score.is_finite() {
             return Err(Error::Invalid("Clustering produced a non-finite score"));
         }
@@ -588,6 +652,51 @@ mod tests {
     }
 
     #[test]
+    fn specialized_gaussians_preserve_scores_and_solve_correlated_systems() {
+        let mut random = Random(425);
+        for dims in [3, 12] {
+            let mean = vec![0.5; dims];
+            let mut lower = vec![0.; dims * dims];
+            for i in 0..dims {
+                for j in 0..=i {
+                    lower[i * dims + j] = if i == j {
+                        1. + random.inclusive(0, 1000) as f64 / 1000.
+                    } else {
+                        random.inclusive(0, 1000) as f64 / 10000. - 0.05
+                    };
+                }
+            }
+            let mut cov = vec![0.; dims * dims];
+            for i in 0..dims {
+                for j in i..dims {
+                    cov[i * dims + j] = (0..dims)
+                        .map(|k| lower[i * dims + k] * lower[j * dims + k])
+                        .sum();
+                }
+            }
+            let gaussian = Gaussian::new(1, &mean, &cov, 0.9).unwrap();
+            let offset: f64 = (0..dims)
+                .map(|i| f64::from(lower[i * dims + i].ln() as f32))
+                .sum::<f64>()
+                - 0.9_f64.ln()
+                + f64::from((2. * std::f64::consts::PI).ln() as f32) * dims as f64 / 2.;
+            for _ in 0..64 {
+                let z: Vec<_> = (0..dims)
+                    .map(|_| random.inclusive(0, 2000) as f64 / 1000. - 1.)
+                    .collect();
+                let point: Vec<_> = (0..dims)
+                    .map(|i| mean[i] + (0..dims).map(|j| lower[i * dims + j] * z[j]).sum::<f64>())
+                    .collect();
+                let actual = gaussian.score(&point, &mut vec![0.; dims]);
+                let fallback = gaussian.score_dynamic(&point, &mut vec![0.; dims]);
+                assert_eq!(actual.to_bits(), fallback.to_bits());
+                let expected = z.iter().map(|x| x * x).sum::<f64>() / 2. + offset;
+                assert!((actual - expected).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
     fn uniform_noise_wins_for_outliers_but_not_for_a_gaussian_peak() {
         let gaussian = Gaussian::new(1, &[0.2, 0.2], &[0.0001, 0., 0., 0.0001], 0.9).unwrap();
         let model = Model {
@@ -615,6 +724,35 @@ mod tests {
         assert_eq!(state.mean[1], 1.5);
         assert!((state.cov[1] - 5. / 3.).abs() < 1e-14);
         assert!((penalty(4, 1, 2) - 1.5 * 4_f64.ln()).abs() < 1e-14);
+    }
+
+    #[test]
+    fn common_dimension_covariances_match_global_moments() {
+        for dims in [3, 12] {
+            let points = 64;
+            let values = (0..points * dims)
+                .map(|i| ((i * 37 + i / dims * 19) % 101) as f64 / 100.)
+                .collect();
+            let data = Arc::new(Data {
+                points,
+                dims,
+                values,
+            });
+            let mut state = State::new(Arc::clone(&data));
+            state.class.fill(1);
+            state.alive[1] = true;
+            state.m_step();
+            for i in 0..dims {
+                let sum_i: f64 = (0..points).map(|p| data.row(p)[i]).sum();
+                assert!((state.mean[dims + i] - sum_i / points as f64).abs() < 1e-14);
+                for j in i..dims {
+                    let sum_j: f64 = (0..points).map(|p| data.row(p)[j]).sum();
+                    let sum_ij: f64 = (0..points).map(|p| data.row(p)[i] * data.row(p)[j]).sum();
+                    let expected = (sum_ij - sum_i * sum_j / points as f64) / (points - 1) as f64;
+                    assert!((state.cov[dims * dims + i * dims + j] - expected).abs() < 1e-12);
+                }
+            }
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -55,7 +56,7 @@ impl Settings {
         let explicit = path.is_some();
         let path = match path {
             Some(path) => path.to_owned(),
-            None => std::env::current_exe()?.with_file_name("fancykk.json"),
+            None => std::env::current_exe()?.with_file_name("ltxk.json"),
         };
         if path.exists() || path.is_symlink() {
             let file = File::open(&path)?;
@@ -102,18 +103,18 @@ pub fn output_path(input: &Path) -> Result<PathBuf> {
     Ok(input.with_extension(format!("clu.{extension}")))
 }
 
-pub fn sort(input: &Path, settings: &Settings, log: &mut dyn Write) -> Result<Output> {
+pub fn cluster_recording(input: &Path, settings: &Settings, log: &mut dyn Write) -> Result<Output> {
     let work = if let Some(parent) = &settings.work_dir {
         tempfile::Builder::new()
-            .prefix("fancykk-")
+            .prefix("ltxk-")
             .tempdir_in(parent)?
     } else {
-        tempfile::Builder::new().prefix("fancykk-").tempdir()?
+        tempfile::Builder::new().prefix("ltxk-").tempdir()?
     };
-    sort_in(input, settings, work.path(), log)
+    cluster_in(input, settings, work.path(), log)
 }
 
-pub fn sort_in(
+pub fn cluster_in(
     input: &Path,
     settings: &Settings,
     work: &Path,
@@ -135,7 +136,8 @@ pub fn sort_in(
             stride: 1,
         });
     }
-    writeln!(log, "Sorting {}", input.display())?;
+    writeln!(log, "Clustering {}", input.display())?;
+    let started = Instant::now();
     let features = crate::extract(&crate::Options {
         input: input.clone(),
         output_base: work.join("recording"),
@@ -145,7 +147,16 @@ pub fn sort_in(
         lapack_library: settings.lapack_library.clone(),
         block_spikes: settings.block_spikes,
     })?;
+    let extracted = Instant::now();
     let store = FeatureStore::create(&features, &work.join("features.bin"))?;
+    if std::env::var_os("LTXK_PROFILE").is_some() {
+        writeln!(
+            log,
+            "Profile extract_s={:.6} cache_s={:.6}",
+            (extracted - started).as_secs_f64(),
+            extracted.elapsed().as_secs_f64()
+        )?;
+    }
     fs::remove_file(features)?;
     let result = cluster::run(&store, &settings.cluster, work, log)?;
     let mut mapping = [1_u8; cluster::MAX_CLUSTERS];
@@ -157,7 +168,7 @@ pub fn sort_in(
         }
     }
     let mut temporary = tempfile::Builder::new()
-        .prefix(".fancykk-")
+        .prefix(".ltxk-")
         .tempfile_in(output.parent().unwrap())?;
     {
         let mut writer = BufWriter::with_capacity(1 << 20, temporary.as_file_mut());

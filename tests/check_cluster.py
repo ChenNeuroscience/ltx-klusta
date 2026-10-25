@@ -1,4 +1,4 @@
-"""End-to-end sorting, atomic output, subset assignment, and process-shared queue."""
+"""End-to-end clustering, atomic output, subset assignment, and process-shared queue."""
 import argparse
 from collections import Counter
 import json
@@ -47,61 +47,61 @@ def check_labels(path, spikes, check_populations=True):
     return labels
 
 
-def check_sort(exe, extra_args=()):
-    with tempfile.TemporaryDirectory(prefix="fancykk sort ") as temporary:
+def check_cluster(exe, extra_args=()):
+    with tempfile.TemporaryDirectory(prefix="ltxk cluster ") as temporary:
         root = Path(temporary)
         source = root / "wave ! λ.1"
         recording(source, 1201)
         original = source.read_bytes()
         output = root / "wave ! λ.clu.1"
-        result = command(exe, "sort", source, *extra_args)
+        result = command(exe, "cluster", source, *extra_args)
         require(result.returncode == 0, result.stderr)
         check_labels(output, 1201)
         first = output.read_bytes()
         # Same seed and backend, independent of PCA block boundaries.
-        result = command(exe, "sort", source, "--force", "--block-spikes", "7", *extra_args)
-        require(result.returncode == 0 and output.read_bytes() == first, "Sort changed across waveform blocks: " + result.stderr)
+        result = command(exe, "cluster", source, "--force", "--block-spikes", "7", *extra_args)
+        require(result.returncode == 0 and output.read_bytes() == first, "Clustering changed across waveform blocks: " + result.stderr)
         output.write_bytes(b"existing output must survive\n")
-        require(command(exe, "sort", source, *extra_args).returncode == 0, "Existing output should be skipped")
+        require(command(exe, "cluster", source, *extra_args).returncode == 0, "Existing output should be skipped")
         require(output.read_bytes() == b"existing output must survive\n", "Existing .clu overwritten without --force")
         source.write_bytes(b"malformed recording")
-        result = command(exe, "sort", source, "--force", *extra_args)
+        result = command(exe, "cluster", source, "--force", *extra_args)
         require(result.returncode != 0 and output.read_bytes() == b"existing output must survive\n",
                 "A failed replacement must preserve the previous output")
         source.write_bytes(original)
-        result = command(exe, "sort", source, "--force", "--target-spikes", "250", *extra_args)
+        result = command(exe, "cluster", source, "--force", "--target-spikes", "250", *extra_args)
         require(result.returncode == 0 and "fitting 300 (stride 4)" in result.stderr, result.stderr)
         check_labels(output, 1201)
         require(source.read_bytes() == original, "Recording changed")
-        require(not list(root.glob("*.fet.*")) and not list(root.glob(".fancykk-*")), "Scratch output leaked beside recording")
+        require(not list(root.glob("*.fet.*")) and not list(root.glob(".ltxk-*")), "Scratch output leaked beside recording")
         config = root / "settings.json"
         (root / "scratch").mkdir()
         config.write_text(json.dumps({"features": "3PC", "work_dir": "scratch",
                                       "cluster": {"min_clusters": 2, "max_clusters": 4}}))
-        result = command(exe, "sort", source, "--config", config, "--force", *extra_args)
+        result = command(exe, "cluster", source, "--config", config, "--force", *extra_args)
         require(result.returncode == 0 and "Start 2:" in result.stderr, result.stderr)
         require(not list((root / "scratch").iterdir()), "Private job directory was not cleaned")
-        missing = command(exe, "sort", source, "--config", root / "missing" / "fancykk.json")
+        missing = command(exe, "cluster", source, "--config", root / "missing" / "ltxk.json")
         require(missing.returncode != 0, "An explicit missing configuration must not be ignored")
         # Direct executable invocation supports Explorer drag-and-drop.
         require(command(exe, source).returncode == 0, "Drag-and-drop positional invocation failed")
         full = root / "four channels.2"
         recording(full, 2400, active_channels=4)
-        result = command(exe, "sort", full, *extra_args)
+        result = command(exe, "cluster", full, *extra_args)
         require(result.returncode == 0 and "12 active features" in result.stderr, result.stderr)
         check_labels(full.with_suffix(".clu.2"), 2400)
         constant = root / "constant.3"
         wave = struct.pack("<I50b", 0, *range(50)) + bytes(3 * 54)
         constant.write_bytes(b"num_spikes 20\r\ndata_start" + wave * 20)
-        result = command(exe, "sort", constant, *extra_args)
+        result = command(exe, "cluster", constant, *extra_args)
         require(result.returncode == 0, result.stderr)
         require(check_labels(constant.with_suffix(".clu.3"), 20, check_populations=False) == [1] * 20,
                 "An entirely constant feature set should produce noise only")
-    print("Combined sorting, reproducibility, subset assignment, configuration, and atomic output passed")
+    print("Combined clustering, reproducibility, subset assignment, configuration, and atomic output passed")
 
 
 def check_queue(exe):
-    with tempfile.TemporaryDirectory(prefix="fancykk queue ") as temporary:
+    with tempfile.TemporaryDirectory(prefix="ltxk queue ") as temporary:
         root = Path(temporary)
         queue = root / "queue"
         paths = []
@@ -215,5 +215,5 @@ if __name__ == "__main__":
     parser.add_argument("--exe", required=True, type=Path)
     args = parser.parse_args()
     exe = args.exe.resolve()
-    check_sort(exe)
+    check_cluster(exe)
     check_queue(exe)

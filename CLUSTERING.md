@@ -1,4 +1,4 @@
-# Classic clustering in fancykk
+# Classic clustering in ltx-klusta
 
 The supported workflow is the one in the original `fancykk/runkk.bat`:
 

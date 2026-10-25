@@ -10,7 +10,7 @@ import tempfile
 
 from check_features import check as check_features, require
 from check_rust import check as check_rust
-from check_sort import check_sort, check_queue
+from check_cluster import check_cluster, check_queue
 
 
 def imports(exe):
@@ -39,7 +39,7 @@ def imports(exe):
 
 def runtime_selection(executable, native_flags):
     from check_rust import command, write_recording
-    with tempfile.TemporaryDirectory(prefix="fancykk backend ") as temporary:
+    with tempfile.TemporaryDirectory(prefix="ltxk backend ") as temporary:
         root = Path(temporary)
         recording = root / "wave.1"
         write_recording(recording, [[(i-10)*((j%5)-2) for j in range(50)] for i in range(21)])
@@ -57,13 +57,13 @@ def runtime_selection(executable, native_flags):
         provider = native_flags[-1] if "--lapack-library" in native_flags else None
         if provider:
             environment = os.environ.copy()
-            environment["FANCYKK_LAPACK_LIBRARY"] = str(provider)
+            environment["LTXK_LAPACK_LIBRARY"] = str(provider)
             automatic = command(executable, *args, "--backend", "auto", env=environment)
             require(automatic.returncode == 0 and "lapack (" in automatic.stderr, automatic.stderr)
 
 
 def check(package, library):
-    executable = package / ("fancykk.exe" if os.name == "nt" else "fancykk")
+    executable = package / ("ltxk.exe" if os.name == "nt" else "ltxk")
     for line in (package / "SHA256SUMS.txt").read_text().splitlines():
         expected, name = line.split("  ", 1)
         require(hashlib.sha256((package / name).read_bytes()).hexdigest() == expected, f"Checksum mismatch: {name}")
@@ -77,22 +77,22 @@ def check(package, library):
     elif sys.platform == "darwin":
         dependencies = subprocess.check_output(["/usr/bin/otool", "-L", str(executable)], text=True)
         require("Accelerate.framework" not in dependencies, "Accelerate must be loaded only at runtime")
-    os.environ.pop("FANCYKK_LAPACK_LIBRARY", None)
+    os.environ.pop("LTXK_LAPACK_LIBRARY", None)
     native_flags = ["--backend", "lapack"]
     if library:
         native_flags += ["--lapack-library", str(library)]
-    with tempfile.TemporaryDirectory(prefix="fancykk isolated package ") as temporary:
+    with tempfile.TemporaryDirectory(prefix="ltxk isolated package ") as temporary:
         previous = Path.cwd()
         try:
             os.chdir(temporary)
             check_features(executable, ("--backend", "nalgebra", "--block-spikes", "7"))
             check_rust(executable, ("--backend", "nalgebra"))
-            check_sort(executable, ("--backend", "nalgebra"))
+            check_cluster(executable, ("--backend", "nalgebra"))
             check_queue(executable)
             runtime_selection(executable, native_flags)
             check_features(executable, (*native_flags, "--block-spikes", "7"))
             check_rust(executable, native_flags)
-            check_sort(executable, native_flags)
+            check_cluster(executable, native_flags)
         finally:
             os.chdir(previous)
     print("The same executable passed nalgebra, auto detection, and runtime LAPACK checks")
@@ -101,6 +101,6 @@ def check(package, library):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--package", type=Path, required=True)
-    parser.add_argument("--lapack-library", type=Path, default=os.environ.get("FANCYKK_TEST_LAPACK_LIBRARY"))
+    parser.add_argument("--lapack-library", type=Path, default=os.environ.get("LTXK_TEST_LAPACK_LIBRARY"))
     args = parser.parse_args()
     check(args.package.resolve(), Path(args.lapack_library).resolve() if args.lapack_library else None)

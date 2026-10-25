@@ -34,7 +34,7 @@ def run(exe, tetrode, root, components, ok=True, extra_args=()):
 
 
 def check(exe, extra_args=()):
-    with tempfile.TemporaryDirectory(prefix="fancykk test ") as directory:
+    with tempfile.TemporaryDirectory(prefix="ltxk test ") as directory:
         root = Path(directory)
         tetrode = root / "input with spaces.1"
         rng = random.Random(943)
