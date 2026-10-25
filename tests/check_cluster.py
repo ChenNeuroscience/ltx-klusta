@@ -150,7 +150,8 @@ def check_queue(exe):
             process.communicate(timeout=5)
         status = command(exe, "status", "--json", "--queue-dir", queue)
         jobs = json.loads(status.stdout)
-        require(len(jobs) == 5 and sum(job["phase"] == "failed" for job in jobs) == 1, "Failures or jobs lost")
+        require(len(jobs) == 5 and sum(job["phase"] == "failed" for job in jobs) == 1,
+                "Failures or jobs lost: " + json.dumps(jobs, ensure_ascii=True))
         require(all(job["phase"] in ("done", "failed") for job in jobs), "Failure blocked later jobs")
         require(largest <= 2, f"Shared concurrency limit was exceeded: {largest}")
         for path in paths:

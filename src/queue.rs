@@ -416,13 +416,24 @@ impl Queue {
                     queue.root.join("progress").join(format!("{}.json", job.id)),
                     job.started_ms.unwrap(),
                 );
-                pipeline::cluster_in_observed(
+                let mut progress_error = None;
+                let result = pipeline::cluster_in_observed(
                     &job.input,
                     &job.settings,
                     &work,
                     &mut log,
-                    &mut |update| publisher.update(update),
-                )
+                    &mut |update| {
+                        // A display update must never abort a clustering run.
+                        if let Err(error) = publisher.update(update) {
+                            progress_error = Some(error);
+                        }
+                        Ok(())
+                    },
+                );
+                if let Some(error) = progress_error {
+                    let _ = writeln!(log, "WARNING: a progress display update failed: {error}");
+                }
+                result
             },
         ));
         let outcome = outcome.unwrap_or(Err(Error::Invalid(
@@ -495,6 +506,51 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progress_write_failure_does_not_abort_clustering() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("constant.1");
+        let mut recording = b"num_spikes 20\r\ndata_start".to_vec();
+        let mut wave = vec![0; 216];
+        for sample in 0..50 {
+            wave[4 + sample] = sample as u8;
+        }
+        for _ in 0..20 {
+            recording.extend_from_slice(&wave);
+        }
+        fs::write(&input, recording).unwrap();
+        let queue = Queue::open(temporary.path().join("queue")).unwrap();
+        let settings = pipeline::Settings::default();
+        let id = queue
+            .submit(std::slice::from_ref(&input), &settings)
+            .unwrap()
+            .remove(0);
+        let pending = queue.root.join("pending").join(format!("{id}.json"));
+        let running = queue.root.join("running").join(format!("{id}.json"));
+        let mut job = Queue::read(&pending).unwrap();
+        job.phase = Phase::Running;
+        job.started_ms = Some(now());
+        save(&pending, &job).unwrap();
+        fs::rename(pending, running).unwrap();
+        // Make every progress write fail, independently of the job log/output.
+        fs::remove_dir(queue.root.join("progress")).unwrap();
+        fs::write(queue.root.join("progress"), b"unavailable").unwrap();
+        let failed = Queue::execute(queue.root.clone(), job).unwrap();
+        assert!(!failed, "{:?}", queue.records().unwrap());
+        assert_eq!(queue.records().unwrap()[0].phase, Phase::Done);
+        assert_eq!(
+            fs::read_to_string(input.with_extension("clu.1"))
+                .unwrap()
+                .lines()
+                .count(),
+            21
+        );
+        assert!(
+            fs::read_to_string(queue.root.join("logs").join(format!("{id}.log")))
+                .unwrap()
+                .contains("progress display update failed")
+        );
+    }
     #[test]
     fn submissions_deduplicate_active_paths_and_coordinator_handoff_is_nonblocking() {
         let temporary = tempfile::tempdir().unwrap();

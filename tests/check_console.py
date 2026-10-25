@@ -77,9 +77,11 @@ def check_plain(exe, root):
     jobs = records(queue)
     require(len(jobs) == 2 and all(j["finished_ms"] >= j["started_ms"] for j in jobs), "Missing job timing")
     good = next(j for j in jobs if j["phase"] == "done")
-    progress = json.loads((queue / "progress" / (good["id"] + ".json")).read_text())
+    progress_path = queue / "progress" / (good["id"] + ".json")
+    require(progress_path.is_file(), "No progress snapshot: " + (queue / "logs" / (good["id"] + ".log")).read_text(encoding="utf-8"))
+    progress = json.loads(progress_path.read_text())
     require(progress["attempt_ms"] == good["started_ms"] and progress["trial"] == progress["trials"] == 3,
-            "Missing structured trial progress")
+            f"Missing structured trial progress: {progress}")
     require(progress["spikes"] == 1201 and progress["fitting_spikes"] == 300, "Progress changed subset policy")
     # Observing the queue must preserve the clustering result.
     original = source.with_suffix(".clu.1").read_bytes()
