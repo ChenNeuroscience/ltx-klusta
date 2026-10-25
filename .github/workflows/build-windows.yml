@@ -137,6 +137,8 @@ jobs:
               archive = output / (package.name + '.zip')
               with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
                   for item in sorted(package.iterdir()):
+                      if package.name.startswith('prekk-rust-macos-') and item.name == 'prekk':
+                          item.chmod(0o755)
                       bundle.write(item, item.name)
               digest = hashlib.sha256(archive.read_bytes()).hexdigest()
               archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')

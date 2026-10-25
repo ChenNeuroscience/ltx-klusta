@@ -88,6 +88,10 @@ the checkout with a restricted DLL search PATH, so tests cannot accidentally
 find numerical DLLs left in the source tree. CI also checks PE imports and file
 checksums. Artifacts are named `prekk-rust-PLATFORM-BACKEND`.
 
+For a macOS Actions artifact, run `chmod +x prekk` after extracting it, because
+GitHub resets artifact file permissions. Published release ZIPs restore the
+executable permission automatically.
+
 Routine CI uses small synthetic recordings. The **large_recording** checkbox in
 **Run workflow** opts into the full 9-million-spike test on both Windows builds,
 including a 256 MiB peak-working-set ceiling. It is off by default. The same test
