@@ -3,11 +3,14 @@
 
 #include <stdlib.h>
 #include <iostream>
-#include <iomanip>      
+#include <iomanip>
 #include <fstream>
 #include <string>
-#include <sstream> 
+#include <sstream>
 #include <stdint.h>
+#include <memory>
+#include <stdexcept>
+#include "size_checks.h"
 #include "armadillo"  // see very helpful instructions here: http://www.ru.is/kennarar/sigurdurh/SCImplementationShort.pdf
 #include <list>
 #include "pca.h"
@@ -29,23 +32,23 @@ vector<string> split(const std::string &s, char delim) {
 	return elems;
 }
 
-int main(int argc, char* argv[])
+static_assert(sizeof(void*) == 8, "Build prekk for a 64-bit target");
+static_assert(sizeof(arma::uword) == 8, "Build with ARMA_64BIT_WORD");
+
+int run(int argc, char* argv[])
 {
-	
+
 	ifstream tetfile;
 	if (argc < 5){
 		cout << "All 4 arguments are required:" << endl << endl <<
 			"1. path to tet file including extension" << endl <<
 			"2. path to temporary file to write out the data for KlustaKwik, but without the .fet.n extension." << endl <<
 			"3. path to temporary file to write out the value of num_spikes" << endl <<
-			"        (this is for use in the batch file for choosing the subsample rate)\n" << endl << 
+			"        (this is for use in the batch file for choosing the subsample rate)\n" << endl <<
 			"4. components to use, e.g: 3PC,A,VT" << endl <<
 			"        (comma-delimited list, with no spaces. PC can be 0,1,2,3,...,9. VT is voltage at time of maximum variance. A is amplitude.)" << endl <<
 			"Remember that if a file path contains spaces you need do \"C:\\quote\\the path\\in double-quotes.txt\"" << endl;
-		int i;
-		cout << endl << "press key to exit";
-		cin >> i;
-		return 0;
+		return 1;
 	}
 
 	string tetfile_name = argv[1];
@@ -56,7 +59,7 @@ int main(int argc, char* argv[])
 	bool use_VT = false;
 	bool use_A = false;
 
-	
+
 	for (size_t i = 0; i < components.size(); i++){
 		string token = components[i];
 
@@ -71,21 +74,15 @@ int main(int argc, char* argv[])
 			cout << "Using " << N_COMPS << " principle components." << endl;
 		}else{
 			cout << "Unable to parse components argument: " << argv[4] << endl << "must be uppercase, and comma-delimited." << endl;
-			int i;
-			cout << endl << "press key to exit";
-			cin >> i;
-			return 0;
+			return 1;
 		}
 	}
-	
+
 	tetfile.open(tetfile_name, ios::in | ios::binary);
 
 	if (!tetfile.is_open()){
 		cout << "could not open file with path:" << endl << tetfile_name;
-		int i;
-		cout << endl << "press key to exit";
-		cin >> i;
-		return 0;
+		return 1;
 
 	}
 
@@ -93,26 +90,43 @@ int main(int argc, char* argv[])
 	string NUM_SPIKES_KEY = "num_spikes";
 
 	string line;
-	int nSpikes = -1;
+	std::int64_t nSpikes = -1;
 	streamoff p = 0;
+	bool found_data = false;
 
-	while (getline(tetfile, line)){ //TODO: this may rely on there being a newline byte somewhere soon after start_token...that's not guaranteed to be true...although I guess the timestamps bytes should increment pretty quickly.
-		if (line.compare(0, START_TOKEN.length(), START_TOKEN) == 0){
+	// data_start is followed immediately by binary data, not necessarily a newline.
+	char header_byte;
+	while (tetfile.get(header_byte)){
+		line += header_byte;
+		if (line == START_TOKEN){
+			p = tetfile.tellg();
+			found_data = true;
 			break;
 		}
+		if (line.size() > 4096)
+			throw std::runtime_error("Invalid tetrode header line");
+		if (header_byte != '\n')
+			continue;
 
 		cout << endl << "    [key value] : " << line;
 
 		if (line.compare(0, NUM_SPIKES_KEY.length(), NUM_SPIKES_KEY) == 0){
 			stringstream line_;
 			line_ << line.substr(NUM_SPIKES_KEY.length());
-			line_ >> nSpikes;
+			if (!(line_ >> nSpikes))
+				throw std::runtime_error("Invalid num_spikes in tetrode header");
 		}
-		p = tetfile.tellg();
+		line.clear();
 
 	}
 
-	p += START_TOKEN.length();
+	if (!found_data)
+		throw std::runtime_error("Missing data_start in tetrode header");
+	const std::size_t bufferSize = prekk::checked_buffer_size(nSpikes);
+	// Reject truncated data before allocating potentially many gigabytes.
+	tetfile.seekg(0, ios::end);
+	if (tetfile.tellg() - p < static_cast<streamoff>(bufferSize))
+		throw std::runtime_error("Tetrode data is shorter than num_spikes requires");
 
 	cout << endl << "found nSpikes=" << nSpikes <<endl	;
 	//cout << endl << "data starts at byte " << (p) << endl;
@@ -124,39 +138,40 @@ int main(int argc, char* argv[])
 	// Ideally we would read this from the original file in the batch script but the language is really limited.
 	ofstream infofile;
 	infofile.open(infofile_name);
+	if (!infofile)
+		throw std::runtime_error("Cannot open spike-count output file");
 	infofile << nSpikes;
 	infofile.close();
 	//-------------------------------------------------------------------------------------------------
 
 
-	int N_SAMPS = 50; 
+	int N_SAMPS = 50;
 	int WAVE_LEN_BYTES = N_SAMPS + 4;
 	int BYTES_PER_SPIKE = WAVE_LEN_BYTES * 4;
-	long bufferSize = BYTES_PER_SPIKE*nSpikes;
-	
-	int8_t* buffer = new int8_t[bufferSize];
+	std::unique_ptr<char[]> buffer(new char[bufferSize]);
 	tetfile.open(tetfile_name, ios::in | ios::binary);
 
 	tetfile.seekg(p);
-	tetfile.read((char*)buffer, bufferSize);
+	if (!tetfile.read(buffer.get(), static_cast<streamsize>(bufferSize)))
+		throw std::runtime_error("Could not read all tetrode spike data");
 	//cout << tetfile.tellg() << " " << tetfile.gcount() <<  endl;
 	tetfile.close();
-	Mat<char> data((char*)buffer, BYTES_PER_SPIKE, nSpikes, false);
+	Mat<char> data(buffer.get(), BYTES_PER_SPIKE, nSpikes, false);
 
 	ofstream tmp;
-	int ext_at = tetfile_name.find_last_of('.');
+	size_t ext_at = tetfile_name.find_last_of('.');
+	if (ext_at == string::npos)
+		throw std::runtime_error("Tetrode filename must have a numeric extension");
 	tmpfile_name += ".fet" + tetfile_name.substr(ext_at);
 	cout << tmpfile_name << endl;
 	tmp.open(tmpfile_name);
-	
+
 	if (!tmp.is_open()){
 		cout << "file not written";
-		int i;
-		cin >> i;
-		return 0;
+		return 1;
 	}
 
-	
+
 
 
 
@@ -176,7 +191,7 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	
+
 	size_t n_cols = (N_COMPS + (use_A ? 1 : 0) + (use_VT ? 1 : 0))*idx;
 	size_t col_i = 0;
 	mat out = zeros<mat>(nSpikes, n_cols);
@@ -194,7 +209,7 @@ int main(int argc, char* argv[])
 
 			stats::pca pca(N_SAMPS);
 
-			for (int i = 0; i < nSpikes; i++) {
+			for (std::int64_t i = 0; i < nSpikes; i++) {
 				vector<double> record(num_variables);
 				pca.add_record(conv_to<stdvec>::from(data_sub.row(i)));
 			}
@@ -221,14 +236,14 @@ int main(int argc, char* argv[])
 		}
 		cout << "Amplitude done" << endl;
 	}
-	 
+
 	if (use_VT){
 		for (int c = 0; c < 4; c++){
 			if (cidx[c] == -1)
 				continue;
 			mat data_sub = conv_to<mat>::from(data.rows(c * WAVE_LEN_BYTES + 4, c * WAVE_LEN_BYTES + WAVE_LEN_BYTES - 1).t()); //select the 50 columns corresponding to the waves on the c'th channel.
 			mat var = arma::var(data_sub, 0, 0);
-			size_t max_ind;
+			arma::uword max_ind;
 			var.max(max_ind); //max_ind passed by non-const ref, and used as output
 			out.col(col_i) = data_sub.col(max_ind); // select out only the voltage from the index with maximum variance
 			col_i++;
@@ -238,7 +253,20 @@ int main(int argc, char* argv[])
 
 	tmp << n_cols << endl;
 	out.raw_print(tmp);
+	tmp.close();
+	if (!tmp)
+		throw std::runtime_error("Could not write all feature data");
 	return 0;
 }
 
-	
+int main(int argc, char* argv[]) {
+	try {
+		return run(argc, argv);
+	} catch (const std::bad_alloc&) {
+		std::cerr << "prekk: Not enough memory for this recording. "
+			"PCA requires several copies of the waveform data.\n";
+	} catch (const std::exception& error) {
+		std::cerr << "prekk: " << error.what() << '\n';
+	}
+	return 1;
+}
