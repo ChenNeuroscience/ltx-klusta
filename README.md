@@ -7,10 +7,16 @@ Input records contain four channels, each with a 4-byte timestamp and 50 signed
 
 ## Windows x64 download
 
-Open this repository's **Actions → Build Windows x64**, select a successful run,
-and download the `prekk-windows-x64` artifact. Unzip it before running.
-The workflow runs on pull requests, pushes to `main`, version tags, and manually
-through **Run workflow** after it is on the default branch.
+Open this repository's [Releases](https://github.com/ChenNeuroscience/prekk/releases)
+and download `prekk-windows-x64.zip` from the latest release. Each release is
+tagged with the short Git commit ID of its source, with a ZIP checksum provided
+as a separate `.sha256` asset. Unzip the download before running.
+
+The workflow builds and tests on pull requests and pushes to `main`. Successful
+pushes to `main` publish a release automatically. It also supports **Actions →
+Build Windows x64 → Run workflow** after it is on the default branch; a successful
+manual run publishes the selected commit. Pull requests do not publish releases.
+The `prekk-windows-x64` Actions artifact remains available for testing PR builds.
 
 The download contains `prekk.exe`, `blas_win64_MT.dll`, `lapack_win64_MT.dll`,
 this README, and SHA-256 checksums. Keep all three executable/library files

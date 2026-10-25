@@ -3,7 +3,6 @@ name: Build Windows x64
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -31,9 +30,57 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Copy-Item build/Release/prekk.exe, build/Release/blas_win64_MT.dll, build/Release/lapack_win64_MT.dll, README.md -Destination dist
-          Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content dist/SHA256SUMS.txt
+          Get-ChildItem dist -File -Exclude SHA256SUMS.txt | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v7
         with:
           name: prekk-windows-x64
           path: dist/
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: prekk-release-${{ github.sha }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: prekk-windows-x64
+          path: dist
+      - name: Package release and select commit tag
+        id: package
+        shell: bash
+        run: |
+          echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import zipfile
+
+          output = Path('release')
+          output.mkdir()
+          archive = output / 'prekk-windows-x64.zip'
+          with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
+              for item in sorted(Path('dist').iterdir()):
+                  bundle.write(item, item.name)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')
+          PY
+      - name: Publish GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.package.outputs.tag }}
+          commit: ${{ github.sha }}
+          name: Windows x64 ${{ steps.package.outputs.tag }}
+          body: Windows x64 prekk built and tested from commit ${{ github.sha }}. Extract the ZIP and keep prekk.exe and both DLLs together.
+          artifacts: release/prekk-windows-x64.zip,release/prekk-windows-x64.zip.sha256
+          artifactErrorsFailBuild: true
+          allowUpdates: true
+          makeLatest: true
