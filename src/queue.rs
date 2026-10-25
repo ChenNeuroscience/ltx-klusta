@@ -274,9 +274,16 @@ impl Queue {
             || -> Result<pipeline::Output> {
                 // A recovered job owns its old private scratch directory too.
                 if work.exists() {
-                    fs::remove_dir_all(&work)?;
+                    fs::remove_dir_all(&work).map_err(|error| {
+                        Error::Message(format!(
+                            "Remove interrupted scratch {}: {error}",
+                            work.display()
+                        ))
+                    })?;
                 }
-                fs::create_dir_all(&work)?;
+                fs::create_dir_all(&work).map_err(|error| {
+                    Error::Message(format!("Create scratch {}: {error}", work.display()))
+                })?;
                 let mut log =
                     File::create(queue.root.join("logs").join(format!("{}.log", job.id)))?;
                 pipeline::sort_in(&job.input, &job.settings, &work, &mut log)

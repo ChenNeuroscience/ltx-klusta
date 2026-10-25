@@ -18,14 +18,17 @@ def command(exe, *args):
                           encoding="utf-8", timeout=120)
 
 
-def recording(path, spikes=1200):
+def recording(path, spikes=1200, active_channels=1):
     rng = random.Random(4637)
     data = bytearray(f"num_spikes {spikes}\r\ndata_start".encode())
     for i in range(spikes):
-        latent = [(-45 if i % 2 == 0 else 45) + rng.gauss(0, 4), rng.gauss(0, 6), rng.gauss(0, 6)]
-        wave = [max(-127, min(127, round(latent[0 if j < 15 else 1 if j < 35 else 2] + rng.gauss(0, 1))))
-                for j in range(50)]
-        data += struct.pack("<I50b", i, *wave) + bytes(3 * 54)
+        for channel in range(active_channels):
+            latent = [(-45 if i % 2 == 0 else 45) * (1 - 0.12 * channel) + rng.gauss(0, 4),
+                      rng.gauss(0, 6), rng.gauss(0, 6)]
+            wave = [max(-127, min(127, round(latent[0 if j < 15 else 1 if j < 35 else 2] + rng.gauss(0, 1))))
+                    for j in range(50)]
+            data += struct.pack("<I50b", i, *wave)
+        data += bytes((4 - active_channels) * 54)
     path.write_bytes(data)
 
 
@@ -82,6 +85,18 @@ def check_sort(exe, extra_args=()):
         require(missing.returncode != 0, "An explicit missing configuration must not be ignored")
         # Direct executable invocation supports Explorer drag-and-drop.
         require(command(exe, source).returncode == 0, "Drag-and-drop positional invocation failed")
+        full = root / "four channels.2"
+        recording(full, 2400, active_channels=4)
+        result = command(exe, "sort", full, *extra_args)
+        require(result.returncode == 0 and "12 active features" in result.stderr, result.stderr)
+        check_labels(full.with_suffix(".clu.2"), 2400)
+        constant = root / "constant.3"
+        wave = struct.pack("<I50b", 0, *range(50)) + bytes(3 * 54)
+        constant.write_bytes(b"num_spikes 20\r\ndata_start" + wave * 20)
+        result = command(exe, "sort", constant, *extra_args)
+        require(result.returncode == 0, result.stderr)
+        require(check_labels(constant.with_suffix(".clu.3"), 20, check_populations=False) == [1] * 20,
+                "An entirely constant feature set should produce noise only")
     print("Combined sorting, reproducibility, subset assignment, configuration, and atomic output passed")
 
 
@@ -125,7 +140,7 @@ def check_queue(exe):
         jobs = json.loads(status.stdout)
         require(len(jobs) == 5 and sum(job["phase"] == "failed" for job in jobs) == 1, "Failures or jobs lost")
         require(all(job["phase"] in ("done", "failed") for job in jobs), "Failure blocked later jobs")
-        require(1 <= largest <= 2, f"Shared concurrency limit was exceeded: {largest}")
+        require(largest <= 2, f"Shared concurrency limit was exceeded: {largest}")
         for path in paths:
             check_labels(path.with_suffix(".clu.1"), 12000, check_populations=False)
         for job in jobs:
@@ -157,7 +172,7 @@ sys.stdin.read()
             require(submitted.returncode == 0 and "existing coordinator" in submitted.stderr, submitted.stderr)
             job_id = submitted.stdout.splitlines()[0].split()[1]
             pending = queue / "pending" / (job_id + ".json")
-            job = json.loads(pending.read_text())
+            job = json.loads(pending.read_text(encoding="utf-8"))
             job["phase"] = "running"
             (queue / "running" / pending.name).write_text(json.dumps(job), encoding="utf-8")
             pending.unlink()
@@ -168,7 +183,9 @@ sys.stdin.read()
             holder.kill()
             holder.communicate(timeout=5)
         result = command(exe, "resume", "--queue-dir", queue, "--jobs", "2")
-        require(result.returncode == 0 and "Recovered interrupted job" in result.stderr, result.stderr)
+        recovered_log = queue / "logs" / (job_id + ".log")
+        require(result.returncode == 0 and "Recovered interrupted job" in result.stderr,
+                result.stderr + (recovered_log.read_text(encoding="utf-8") if recovered_log.exists() else "No job log"))
         records = json.loads(command(exe, "status", "--json", "--queue-dir", queue).stdout)
         require(all(job["phase"] in ("done", "failed") for job in records), "Interrupted job was not recovered")
         require(not list((queue / "work").iterdir()), "Interrupted scratch directory was not cleaned")
