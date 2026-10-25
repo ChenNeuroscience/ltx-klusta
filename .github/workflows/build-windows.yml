@@ -64,11 +64,11 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
-      - name: Format, lint, and unit tests
+      - name: Format, lint, and release unit tests
         run: |
           cargo fmt --check
           cargo clippy --all-targets --locked ${{ matrix.cargo_args }} -- -D warnings
-          cargo test --locked ${{ matrix.cargo_args }}
+          cargo test --release --locked ${{ matrix.cargo_args }}
       - name: Build Rust release
         run: cargo build --release --locked ${{ matrix.cargo_args }}
       - name: Configure C++ numerical reference (Windows)

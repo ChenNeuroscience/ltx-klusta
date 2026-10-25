@@ -24,14 +24,14 @@ pub const MAX_SPIKES: u64 = i32::MAX as u64;
 pub enum Error {
     Io(io::Error),
     Invalid(&'static str),
-    Lapack(i32),
+    Lapack { routine: &'static str, info: i32 },
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => error.fmt(f),
             Self::Invalid(message) => f.write_str(message),
-            Self::Lapack(info) => write!(f, "LAPACK DSYEVD failed (INFO={info})"),
+            Self::Lapack { routine, info } => write!(f, "LAPACK {routine} failed (INFO={info})"),
         }
     }
 }

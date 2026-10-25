@@ -36,7 +36,7 @@ There are two builds, both using the same streaming reader and feature writer:
 | Build | Covariance/PCA | Runtime numerical libraries |
 | --- | --- | --- |
 | `nalgebra` (default Cargo build) | Pure Rust matrix multiplication and symmetric eigensolver | None |
-| `lapack` (`--features lapack`) | BLAS `DSYRK` and LAPACK `DSYEVD` | Windows: the two bundled x64 DLLs; macOS: system Accelerate |
+| `lapack` (`--features lapack`) | BLAS `DSYRK` and LAPACK `DSYEVD`, with `DSYEV` on convergence failure | Windows: the two bundled x64 DLLs; macOS: system Accelerate |
 
 Choose the `nalgebra` Windows package for an executable without external
 numerical DLLs. Rust's Windows C runtime is linked statically as well; Windows
@@ -109,3 +109,7 @@ retained PCA subspace instead of requiring an arbitrary vector basis to match.
 This is not a guarantee of byte-identical clustering: floating-point differences
 and valid rotations can still affect a downstream algorithm. Compare a known
 recording before adopting the experimental build for analysis.
+
+The LAPACK build preserves Armadillo's fallback from divide-and-conquer `DSYEVD`
+to QR-based `DSYEV` when the first solver cannot converge. The original covariance
+is restored for that retry, because both routines overwrite their input matrix.

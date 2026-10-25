@@ -88,6 +88,9 @@ impl std::fmt::Display for Backend {
 
 #[cfg(feature = "lapack")]
 fn lapack_eigen(mut matrix: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
+    // Both routines overwrite A, including on failure. Preserve the covariance
+    // for the same DSYEVD -> DSYEV convergence fallback as Armadillo.
+    let original = matrix.clone();
     let n = SAMPLES as i32;
     let mut values = vec![0.0; SAMPLES];
     // Match the working C++ reference: use the upper triangle and its
@@ -114,8 +117,45 @@ fn lapack_eigen(mut matrix: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
             &mut info,
         );
     }
+    if info > 0 {
+        return lapack_qr(original);
+    }
+    if info < 0 {
+        return Err(Error::Lapack {
+            routine: "DSYEVD",
+            info,
+        });
+    }
+    Ok((values, matrix))
+}
+
+#[cfg(feature = "lapack")]
+fn lapack_qr(mut matrix: DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>)> {
+    let n = SAMPLES as i32;
+    let mut values = vec![0.0; SAMPLES];
+    let mut work = vec![0.0; 3 * (3 * SAMPLES - 1)];
+    let lwork = work.len() as i32;
+    let mut info = 0;
+    // SAFETY: A is column-major 50x50, W has 50 elements, and WORK exceeds
+    // DSYEV's documented 3*N-1 minimum. The ABI matches the DSYEVD call above.
+    unsafe {
+        lapack::dsyev(
+            b'V',
+            b'U',
+            n,
+            matrix.as_mut_slice(),
+            n,
+            &mut values,
+            &mut work,
+            lwork,
+            &mut info,
+        );
+    }
     if info != 0 {
-        return Err(Error::Lapack(info));
+        return Err(Error::Lapack {
+            routine: "DSYEV",
+            info,
+        });
     }
     Ok((values, matrix))
 }
@@ -189,5 +229,26 @@ mod tests {
                 backend.name()
             );
         }
+    }
+
+    #[cfg(feature = "lapack")]
+    #[test]
+    fn qr_fallback_has_correct_eigenpairs() {
+        let matrix = DMatrix::from_fn(SAMPLES, SAMPLES, |row, column| {
+            if row == column {
+                row as f64 + 1.0
+            } else if row.abs_diff(column) == 1 {
+                0.3
+            } else {
+                0.0
+            }
+        });
+        let (values, vectors) = lapack_qr(matrix.clone()).unwrap();
+        let residual = &matrix * &vectors
+            - &vectors * DMatrix::from_diagonal(&nalgebra::DVector::from_vec(values));
+        assert!(residual.norm() / matrix.norm() < 1e-12);
+        assert!(
+            (vectors.transpose() * vectors - DMatrix::identity(SAMPLES, SAMPLES)).norm() < 1e-12
+        );
     }
 }
