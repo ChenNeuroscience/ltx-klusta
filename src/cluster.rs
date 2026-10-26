@@ -128,23 +128,10 @@ impl Gaussian {
         }
     }
 
-    // Common 3PC dimensions let LLVM remove loop bounds and unroll the solve.
-    // Cached reciprocal diagonals replace repeated divisions. All reductions
-    // retain their order, but each reciprocal multiplication can round differently.
-    fn score_fixed<const D: usize>(&self, point: &[f64], root: &mut [f64]) -> f64 {
-        let mean: &[f64; D] = self.mean.as_slice().try_into().unwrap();
-        let lower: &[[f64; D]; D] = self.lower.as_chunks::<D>().0.try_into().unwrap();
-        let inverse_diagonal: &[f64; D] = self.inverse_diagonal.as_slice().try_into().unwrap();
-        let point: &[f64; D] = point.try_into().unwrap();
-        let root: &mut [f64; D] = root.try_into().unwrap();
-        for i in 0..D {
-            let mut value = point[i] - mean[i];
-            for (j, &previous) in root[..i].iter().enumerate() {
-                value -= lower[i][j] * previous;
-            }
-            root[i] = value * inverse_diagonal[i];
-        }
-        root.iter().map(|x| x * x).sum::<f64>() / 2.0 + self.offset
+    // The shared kernel owns its scratch space for common dimensions; the
+    // caller's scratch is needed only by the generic fallback.
+    fn score_fixed<const D: usize>(&self, point: &[f64], _root: &mut [f64]) -> f64 {
+        self.score_batch_fixed::<D, 1>([point.try_into().unwrap()])[0]
     }
 
     fn score_dynamic(&self, point: &[f64], root: &mut [f64]) -> f64 {
@@ -157,6 +144,69 @@ impl Gaussian {
             root[i] = value / self.lower[i * dims + i];
         }
         root.iter().map(|x| x * x).sum::<f64>() / 2.0 + self.offset
+    }
+
+    fn score_batch_fixed<const D: usize, const B: usize>(
+        &self,
+        points: [&[f64; D]; B],
+    ) -> [f64; B] {
+        let mean: &[f64; D] = self.mean.as_slice().try_into().unwrap();
+        let lower: &[[f64; D]; D] = self.lower.as_chunks::<D>().0.try_into().unwrap();
+        let inverse: &[f64; D] = self.inverse_diagonal.as_slice().try_into().unwrap();
+        // D is 3 or 12. Explicit rows make both triangular loop bounds constant:
+        // LLVM otherwise leaves a branch ladder in the common 12-feature solve.
+        // B=1 is the scalar path; B=4 gives independent lanes for full E-steps.
+        // Each spike retains the scalar multiply/subtract and norm-sum order.
+        let mut root = [[0.; B]; D];
+        macro_rules! row {
+            ($i:literal) => {{
+                let mut value: [f64; B] = std::array::from_fn(|b| points[b][$i] - mean[$i]);
+                for (j, previous) in root[..$i].iter().enumerate() {
+                    for b in 0..B {
+                        value[b] -= lower[$i][j] * previous[b];
+                    }
+                }
+                for b in 0..B {
+                    root[$i][b] = value[b] * inverse[$i];
+                }
+            }};
+        }
+        row!(0);
+        row!(1);
+        row!(2);
+        if D == 12 {
+            row!(3);
+            row!(4);
+            row!(5);
+            row!(6);
+            row!(7);
+            row!(8);
+            row!(9);
+            row!(10);
+            row!(11);
+        }
+        let mut norms = [-0_f64; B]; // Same identity as Iterator::sum::<f64>().
+        for row in &root {
+            for b in 0..B {
+                norms[b] += row[b] * row[b];
+            }
+        }
+        norms.map(|norm| norm / 2. + self.offset)
+    }
+
+    fn score_all_fixed<const D: usize>(&self, data: &Data, output: &mut [f64]) {
+        const B: usize = 4;
+        let first = output.len() / B * B;
+        let rows = data.values.as_chunks::<D>().0;
+        let (blocks, tail) = output.as_chunks_mut::<B>();
+        for (block, points) in blocks.iter_mut().zip(rows.as_chunks::<B>().0) {
+            let points = std::array::from_fn(|b| &points[b]);
+            block.copy_from_slice(&self.score_batch_fixed::<D, B>(points));
+        }
+        let mut root = [0.; D];
+        for (point, score) in rows[first..].iter().zip(tail) {
+            *score = self.score(point, &mut root);
+        }
     }
 }
 
@@ -470,8 +520,15 @@ impl State {
                 continue;
             };
             if full {
-                for (p, score) in self.scores[c * n..(c + 1) * n].iter_mut().enumerate() {
-                    *score = gaussian.score(self.data.row(p), &mut root);
+                let column = &mut self.scores[c * n..(c + 1) * n];
+                match self.data.dims {
+                    3 => gaussian.score_all_fixed::<3>(&self.data, column),
+                    12 => gaussian.score_all_fixed::<12>(&self.data, column),
+                    _ => {
+                        for (p, score) in column.iter_mut().enumerate() {
+                            *score = gaussian.score(self.data.row(p), &mut root);
+                        }
+                    }
                 }
                 continue;
             }
@@ -980,6 +1037,144 @@ mod tests {
                 assert!((actual - fallback).abs() <= 16. * f64::EPSILON * (1. + fallback.abs()));
                 let expected = z.iter().map(|x| x * x).sum::<f64>() / 2. + offset;
                 assert!((actual - expected).abs() < 1e-6);
+            }
+        }
+    }
+
+    // Original scalar reciprocal solve, before loop unrolling and batching.
+    fn scalar_reciprocal_reference(gaussian: &Gaussian, point: &[f64]) -> f64 {
+        let d = gaussian.mean.len();
+        let mut root = vec![0.; d];
+        for i in 0..d {
+            let mut value = point[i] - gaussian.mean[i];
+            for (j, &previous) in root[..i].iter().enumerate() {
+                value -= gaussian.lower[i * d + j] * previous;
+            }
+            root[i] = value * gaussian.inverse_diagonal[i];
+        }
+        root.iter().map(|x| x * x).sum::<f64>() / 2. + gaussian.offset
+    }
+
+    fn check_batched_scores<const D: usize>() {
+        let mut lower = [[0.; D]; D];
+        for (i, row) in lower.iter_mut().enumerate() {
+            for (j, value) in row[..=i].iter_mut().enumerate() {
+                *value = if i == j {
+                    0.25 + i as f64 / 32.
+                } else {
+                    (i + j) as f64 / 256.
+                };
+            }
+        }
+        let mut cov = vec![0.; D * D];
+        for i in 0..D {
+            for j in i..D {
+                cov[i * D + j] = (0..D).map(|k| lower[i][k] * lower[j][k]).sum();
+            }
+        }
+        let gaussian = Gaussian::new(1, &[0.5; D], &cov, 0.7).unwrap();
+        for n in 1..=33 {
+            let data = Data {
+                dims: D,
+                points: n,
+                values: (0..n * D)
+                    .map(|i| ((i * 37 + i / D * 19) % 101) as f64 / 25. - 2.)
+                    .collect(),
+            };
+            let expected: Vec<_> = (0..n)
+                .map(|p| scalar_reciprocal_reference(&gaussian, data.row(p)).to_bits())
+                .collect();
+            let mut actual = vec![f64::INFINITY; n];
+            gaussian.score_all_fixed::<D>(&data, &mut actual);
+            assert_eq!(
+                actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected
+            );
+            for (p, &expected) in expected.iter().enumerate() {
+                assert_eq!(
+                    gaussian.score(data.row(p), &mut [0.; D]).to_bits(),
+                    expected
+                );
+            }
+            // Quick steps gather nonadjacent rows, including repeated points.
+            let indices = [n - 1, 0, n / 2, n - 1];
+            let scores = gaussian.score_batch_fixed::<D, 4>(std::array::from_fn(|b| {
+                data.row(indices[b]).try_into().unwrap()
+            }));
+            for b in 0..4 {
+                assert_eq!(scores[b].to_bits(), expected[indices[b]]);
+            }
+        }
+    }
+
+    #[test]
+    fn unrolled_and_batched_likelihoods_keep_scalar_arithmetic() {
+        check_batched_scores::<3>();
+        check_batched_scores::<12>();
+    }
+
+    #[test]
+    fn full_and_quick_steps_preserve_stale_score_history() {
+        for dims in [3, 12] {
+            for n in 208..=213 {
+                for full in [false, true] {
+                    let data = Arc::new(Data {
+                        dims,
+                        points: n,
+                        values: (0..n * dims)
+                            .map(|i| ((i * 37 + i / dims * 19) % 101) as f64 / 100.)
+                            .collect(),
+                    });
+                    let mut state = State::new(data);
+                    state.class = (0..n).map(|p| [0, 1, 7][p % 3]).collect();
+                    state.old_class = state
+                        .class
+                        .iter()
+                        .enumerate()
+                        .map(|(p, &c)| if p % 7 == 0 { 2 } else { c })
+                        .collect();
+                    state.alive[1] = true;
+                    state.alive[7] = true;
+                    state.weight[0] = 0.5;
+                    for c in [1, 7] {
+                        state.weight[c] = 0.25;
+                        for i in 0..dims {
+                            state.mean[c * dims + i] = 0.5;
+                            state.cov[c * dims * dims + i * dims + i] = 0.05;
+                        }
+                    }
+                    state.ensure_score_columns(8);
+                    state.scores = (0..8 * n)
+                        .map(|i| {
+                            if i % 17 == 0 {
+                                f64::INFINITY
+                            } else {
+                                (i * 37 % 109) as f64 - 54.
+                            }
+                        })
+                        .collect();
+                    let mut expected = state.scores.clone();
+                    expected[..n].fill(state.noise_score());
+                    for c in state.ids().into_iter().skip(1) {
+                        let gaussian = state.gaussian(c).unwrap();
+                        for p in 0..n {
+                            if !full
+                                && state.class[p] == state.old_class[p]
+                                && expected[c * n + p] - expected[state.class[p] * n + p]
+                                    > 1000_f64.ln()
+                            {
+                                continue;
+                            }
+                            expected[c * n + p] =
+                                scalar_reciprocal_reference(&gaussian, state.data.row(p));
+                        }
+                    }
+                    state.e_step(full);
+                    assert_eq!(
+                        state.scores.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                    );
+                }
             }
         }
     }
