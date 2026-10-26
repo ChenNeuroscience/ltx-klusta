@@ -1,5 +1,6 @@
 """Smoke-test the portable benchmark helper without using real recordings."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +22,9 @@ def check_benchmark(exe):
         report = root / "report.json"
         command = [sys.executable, str(helper), "--baseline", str(exe), "--candidate", str(exe),
                    "--recordings", str(source), "--runs", "2", "--output", str(report)]
-        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=60)
+        environment = os.environ.copy()
+        environment["PYTHONIOENCODING"] = "cp1252"
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", env=environment, timeout=60)
         require(result.returncode == 0, result.stdout + result.stderr)
         data = json.loads(report.read_text(encoding="utf-8"))
         require([r["build"] for r in data["runs"]] == ["baseline", "candidate", "candidate", "baseline"],

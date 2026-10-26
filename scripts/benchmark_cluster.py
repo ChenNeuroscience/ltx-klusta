@@ -10,6 +10,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -121,6 +122,8 @@ def benchmark(args):
 
 
 if __name__ == "__main__":
+    # Redirected Python output on Windows otherwise uses the legacy code page.
+    sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
