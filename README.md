@@ -32,9 +32,9 @@ Unicode, and punctuation. Results are written beside each input:
 `--force` is given. A failed job leaves any previous output intact; new output
 is published atomically after it is complete.
 
-Defaults match the original fancykk batch file: `3PC`, classic unmasked
-clustering, initial cluster counts 20–30, seed 1, a 25,000-spike fitting target,
-and four simultaneous recordings. PCA uses every spike. Clustering fits a
+Clustering defaults match the original fancykk batch file: `3PC`, classic unmasked
+clustering, initial cluster counts 20–30, seed 1, and a 25,000-spike fitting target.
+Recording concurrency is chosen automatically. PCA uses every spike. Clustering fits a
 stratified subset for large recordings and assigns **all** spikes using the
 fitted model. Its historical floor rule can fit up to 49,999 spikes; nine
 million spikes use exactly 25,000 fitting spikes. Full-record assignment is
@@ -74,8 +74,24 @@ Without an interactive terminal, `--console` prints plain progress and job
 logs and exits on completion. `enqueue` without `--console` or `--background`
 participates in the queue with plain foreground output. Use `--background`
 explicitly when detached processing is wanted.
-One coordinator processes at most four jobs at once by default, even when
-several processes submit recordings. Its `--jobs` value sets the active limit.
+One coordinator enforces the worker limit across separate submissions.
+By default, `auto` uses about 75% of the available CPU threads, leaving at
+least one unused by the worker pool when multiple CPUs are available, with a
+maximum of eight simultaneous files.
+The OS still schedules threads normally; CPU cores are not pinned or reserved.
+For example, eight available CPUs select six workers; four select three.
+If CPU detection is unavailable, the fallback is one worker.
+
+Use `--jobs 4` or a numeric `jobs` setting for a fixed limit (1–16), or
+`--jobs auto` / `"jobs": "auto"` for automatic selection. Omitting the setting
+also selects auto. The dashboard shows the chosen worker maximum. The limit
+stays fixed for the active coordinator; later submissions do not change it.
+`resume` reads the same configuration when `--jobs` is omitted.
+
+The default nalgebra backend mostly uses one CPU thread per file. A native
+BLAS/LAPACK provider can use additional threads during PCA. Autosizing is a CPU
+budget, not a live RAM/load controller; reduce `--jobs` when you want more
+headroom or are limited by the recording/scratch disk's throughput.
 Duplicate pending/running recordings share one job. Completed jobs can be
 submitted again; existing `.clu.N` files are still skipped by default.
 
@@ -156,7 +172,7 @@ the same settings previously edited at the top of the batch file:
     "max_iterations": 10000
   },
   "backend": "nalgebra",
-  "jobs": 4
+  "jobs": "auto"
 }
 ```
 
