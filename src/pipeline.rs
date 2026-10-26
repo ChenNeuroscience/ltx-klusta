@@ -1,7 +1,7 @@
 use crate::progress::{Stage, Update};
 use crate::{
-    cluster, feature_store::FeatureStore, Backend, Error, Features, Result, DEFAULT_BLOCK_SPIKES,
-    MAX_BLOCK_SPIKES,
+    cluster, feature_store::FEATURE_MEMORY_LIMIT, Backend, Error, Features, Result,
+    DEFAULT_BLOCK_SPIKES, MAX_BLOCK_SPIKES,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -152,7 +152,7 @@ pub(crate) fn cluster_in_observed(
     writeln!(log, "Extracting {} features...", settings.features)?;
     notify(Update::Stage(Stage::Extracting))?;
     let started = Instant::now();
-    let features = crate::extract_logged(
+    let features = crate::extract_builder(
         &crate::Options {
             input: input.clone(),
             output_base: work.join("recording"),
@@ -162,12 +162,15 @@ pub(crate) fn cluster_in_observed(
             lapack_library: settings.lapack_library.clone(),
             block_spikes: settings.block_spikes,
         },
+        &work.join("features.bin"),
+        FEATURE_MEMORY_LIMIT,
         log,
     )?;
     let extracted = Instant::now();
     writeln!(log, "Preparing clustering features...")?;
     notify(Update::Stage(Stage::Features))?;
-    let store = FeatureStore::create(&features, &work.join("features.bin"))?;
+    let store = features.finish()?;
+    writeln!(log, "Features: {}", store.description())?;
     if std::env::var_os("LTXK_PROFILE").is_some() {
         writeln!(
             log,
@@ -176,7 +179,6 @@ pub(crate) fn cluster_in_observed(
             extracted.elapsed().as_secs_f64()
         )?;
     }
-    fs::remove_file(features)?;
     let result = cluster::run_observed(&store, &settings.cluster, work, log, notify)?;
     notify(Update::TrialDone {
         clusters: result.counts.iter().skip(1).filter(|&&n| n > 0).count(),
