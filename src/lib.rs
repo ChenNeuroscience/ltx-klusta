@@ -1,4 +1,4 @@
-//! Two-pass feature extraction with memory bounded by block size, not spike count.
+//! Two-pass PCA with bounded waveform buffers and streaming feature sinks.
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ltxk requires a 64-bit target");
@@ -318,20 +318,6 @@ pub fn extract(options: &Options) -> Result<PathBuf> {
 }
 
 pub(crate) fn extract_logged(options: &Options, log: &mut dyn Write) -> Result<PathBuf> {
-    if !(1..=MAX_BLOCK_SPIKES).contains(&options.block_spikes) {
-        return Err(Error::Invalid("block-spikes must be between 1 and 65536"));
-    }
-    let mut reader = BufReader::with_capacity(1 << 20, File::open(&options.input)?);
-    let header = read_header(&mut reader)?;
-    let end = header
-        .offset
-        .checked_add(checked_payload_size(header.spikes)?)
-        .ok_or(Error::Invalid("Spike payload size overflow"))?;
-    if reader.get_ref().metadata()?.len() < end {
-        return Err(Error::Invalid(
-            "Tetrode data is shorter than num_spikes requires",
-        ));
-    }
     let output = feature_path(&options.input, &options.output_base)?;
     let input = fs::canonicalize(&options.input)?;
     let (canonical_features, canonical_info) =
@@ -344,84 +330,199 @@ pub(crate) fn extract_logged(options: &Options, log: &mut dyn Write) -> Result<P
             "Input, feature output, and count output must be different files",
         ));
     }
-    let engine = Engine::resolve(options.backend, options.lapack_library.as_deref())?;
-    writeln!(
-        log,
-        "{} spikes; {} backend; blocks of {} spikes",
-        header.spikes,
-        engine.description(),
-        options.block_spikes
-    )?;
-    let mut raw = vec![0; options.block_spikes * BYTES_PER_SPIKE];
-    let models = build_models(&mut reader, &header, options, &engine, &mut raw)?;
-    reader.seek(SeekFrom::Start(header.offset))?;
+    let extraction = Extraction::prepare(options, log)?;
+    let spikes = extraction.header.spikes;
     let mut writer = BufWriter::with_capacity(1 << 20, File::create(&output)?);
-    let width = models.len() * options.features.width();
-    writeln!(writer, "{width}")?;
-    let mut features = Vec::with_capacity(width);
-    let mut left = header.spikes;
-    while left > 0 {
-        let count = left.min(options.block_spikes as u64) as usize;
-        reader.read_exact(&mut raw[..count * BYTES_PER_SPIKE])?;
-        for record in raw[..count * BYTES_PER_SPIKE]
-            .as_chunks::<BYTES_PER_SPIKE>()
-            .0
-        {
-            features.clear();
-            let wave = |channel: usize| {
-                &record[channel * (4 + SAMPLES) + 4..(channel + 1) * (4 + SAMPLES)]
-            };
-            // Feature order: all channels' PCs, then all A, then all VT.
-            for model in &models {
-                for direction in model.directions.column_iter() {
-                    let score = wave(model.channel)
-                        .iter()
-                        .zip(model.mean)
-                        .zip(direction.iter())
-                        .map(|((&sample, mean), loading)| {
-                            (f64::from(sample as i8) - mean) * loading
-                        })
-                        .sum();
-                    features.push(score);
-                }
+    writeln!(writer, "{}", extraction.width())?;
+    extraction.rows(|features| {
+        for (i, value) in features.iter().enumerate() {
+            if i > 0 {
+                write!(writer, " ")?;
             }
-            if options.features.amplitude {
-                for model in &models {
-                    let (mut minimum, mut maximum) = (i8::MAX, i8::MIN);
-                    for &value in wave(model.channel) {
-                        minimum = minimum.min(value as i8);
-                        maximum = maximum.max(value as i8);
-                    }
-                    features.push(f64::from(i16::from(maximum) - i16::from(minimum)));
-                }
-            }
-            if options.features.voltage {
-                for model in &models {
-                    features.push(f64::from(wave(model.channel)[model.voltage_sample] as i8));
-                }
-            }
-            for (i, value) in features.iter().enumerate() {
-                if i > 0 {
-                    write!(writer, " ")?;
-                }
-                // Write six significant decimal digits; scientific text
-                // is accepted by KlustaKwik and avoids huge per-record allocations.
-                write!(writer, "{value:.5e}")?;
-            }
-            writeln!(writer)?;
+            write!(writer, "{value:.5e}")?;
         }
-        left -= count as u64;
-    }
+        writeln!(writer)?;
+        Ok(())
+    })?;
     writer.flush()?;
     let mut info = BufWriter::new(File::create(&options.info)?);
-    write!(info, "{}", header.spikes)?;
+    write!(info, "{spikes}")?;
     info.flush()?;
     Ok(output)
+}
+
+pub(crate) fn extract_builder(
+    options: &Options,
+    cache: &Path,
+    memory_limit: usize,
+    log: &mut dyn Write,
+) -> Result<feature_store::FeatureBuilder> {
+    let extraction = Extraction::prepare(options, log)?;
+    let mut builder = feature_store::FeatureBuilder::new(
+        extraction.width(),
+        extraction.header.spikes as usize,
+        cache,
+        memory_limit,
+    )?;
+    extraction.rows(|row| builder.push(row))?;
+    Ok(builder)
+}
+
+struct Extraction {
+    reader: BufReader<File>,
+    header: Header,
+    raw: Vec<u8>,
+    models: Vec<ChannelModel>,
+    features: Features,
+    block_spikes: usize,
+}
+impl Extraction {
+    fn prepare(options: &Options, log: &mut dyn Write) -> Result<Self> {
+        if !(1..=MAX_BLOCK_SPIKES).contains(&options.block_spikes) {
+            return Err(Error::Invalid("block-spikes must be between 1 and 65536"));
+        }
+        let mut reader = BufReader::with_capacity(1 << 20, File::open(&options.input)?);
+        let header = read_header(&mut reader)?;
+        let end = header
+            .offset
+            .checked_add(checked_payload_size(header.spikes)?)
+            .ok_or(Error::Invalid("Spike payload size overflow"))?;
+        if reader.get_ref().metadata()?.len() < end {
+            return Err(Error::Invalid(
+                "Tetrode data is shorter than num_spikes requires",
+            ));
+        }
+        let engine = Engine::resolve(options.backend, options.lapack_library.as_deref())?;
+        writeln!(
+            log,
+            "{} spikes; {} backend; blocks of {} spikes",
+            header.spikes,
+            engine.description(),
+            options.block_spikes
+        )?;
+        let mut raw = vec![0; options.block_spikes * BYTES_PER_SPIKE];
+        let models = build_models(&mut reader, &header, options, &engine, &mut raw)?;
+        reader.seek(SeekFrom::Start(header.offset))?;
+        Ok(Self {
+            reader,
+            header,
+            raw,
+            models,
+            features: options.features,
+            block_spikes: options.block_spikes,
+        })
+    }
+    fn width(&self) -> usize {
+        self.models.len() * self.features.width()
+    }
+    fn rows(mut self, mut visit: impl FnMut(&[f64]) -> Result<()>) -> Result<()> {
+        let width = self.width();
+        let mut features = Vec::with_capacity(width);
+        let mut left = self.header.spikes;
+        while left > 0 {
+            let count = left.min(self.block_spikes as u64) as usize;
+            self.reader
+                .read_exact(&mut self.raw[..count * BYTES_PER_SPIKE])?;
+            for record in self.raw[..count * BYTES_PER_SPIKE]
+                .as_chunks::<BYTES_PER_SPIKE>()
+                .0
+            {
+                features.clear();
+                let wave = |channel: usize| {
+                    &record[channel * (4 + SAMPLES) + 4..(channel + 1) * (4 + SAMPLES)]
+                };
+                // Feature order: all channels' PCs, then all A, then all VT.
+                for model in &self.models {
+                    for direction in model.directions.column_iter() {
+                        let score = wave(model.channel)
+                            .iter()
+                            .zip(model.mean)
+                            .zip(direction.iter())
+                            .map(|((&sample, mean), loading)| {
+                                (f64::from(sample as i8) - mean) * loading
+                            })
+                            .sum();
+                        features.push(score);
+                    }
+                }
+                if self.features.amplitude {
+                    for model in &self.models {
+                        let (mut minimum, mut maximum) = (i8::MAX, i8::MIN);
+                        for &value in wave(model.channel) {
+                            minimum = minimum.min(value as i8);
+                            maximum = maximum.max(value as i8);
+                        }
+                        features.push(f64::from(i16::from(maximum) - i16::from(minimum)));
+                    }
+                }
+                if self.features.voltage {
+                    for model in &self.models {
+                        features.push(f64::from(wave(model.channel)[model.voltage_sample] as i8));
+                    }
+                }
+                visit(&features)?;
+            }
+            left -= count as u64;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_features_use_no_text_files_and_match_disk_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("recording.1");
+        let mut raw = b"num_spikes 32\r\ndata_start".to_vec();
+        for spike in 0..32_u32 {
+            for channel in 0..CHANNELS {
+                raw.extend_from_slice(&spike.to_le_bytes());
+                for sample in 0..SAMPLES {
+                    let value = if channel == 0 {
+                        ((spike as usize * 7 + sample * 3) % 101) as i8 - 50
+                    } else {
+                        0
+                    };
+                    raw.push(value as u8);
+                }
+            }
+        }
+        fs::write(&input, raw).unwrap();
+        for features in ["3PC", "3PC,A,VT", "A,VT"] {
+            let options = Options {
+                input: input.clone(),
+                output_base: dir.path().join("export"),
+                info: dir.path().join("count"),
+                features: Features::parse(features).unwrap(),
+                backend: Backend::Nalgebra,
+                lapack_library: None,
+                block_spikes: 7,
+            };
+            let ram = extract_builder(
+                &options,
+                &dir.path().join("ram.bin"),
+                feature_store::FEATURE_MEMORY_LIMIT,
+                &mut Vec::new(),
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            let disk = extract_builder(&options, &dir.path().join("disk.bin"), 0, &mut Vec::new())
+                .unwrap()
+                .finish()
+                .unwrap();
+            assert_eq!(ram.points, 32);
+            assert_eq!(
+                ram.load_indices(&[0, 17, 31, 17]).unwrap().values,
+                disk.load_indices(&[0, 17, 31, 17]).unwrap().values
+            );
+            assert!(!dir.path().join("ram.bin").exists());
+            assert!(!feature_path(&input, &options.output_base).unwrap().exists());
+            assert!(!options.info.exists());
+        }
+    }
     #[test]
     fn payload_sizes_cross_old_overflows_without_allocation() {
         for (spikes, bytes) in [

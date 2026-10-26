@@ -1,14 +1,24 @@
 # Performance work
 
-The optimisations preserve the model, feature precision, global normalization,
+The optimisations preserve the model, global normalization,
 Windows random generator, sampling rule, trial schedule and convergence rules.
 They do not reduce the fitting target or initial-count trials. Score storage
 changes preserve the arithmetic exactly. The common Gaussian scoring kernels
 use cached reciprocal diagonals, which can change floating-point rounding and,
 on sensitive data, later decisions. This retains the same mathematical solve.
 
+Direct-f32 feature extraction also intentionally removes the preceding decimal
+rounding step. This retains more feature precision, but can change the search
+trajectory and final model; see the separate results below.
+
 ## Implemented
 
+- **Feed features directly into f32 storage.** Remove decimal formatting,
+  temporary `.fet` writes and reparsing from clustering. Keep up to 64 MiB of
+  features per job in RAM; stream larger sets to a binary cache. Both paths use
+  identical f32 values and full-record normalization. The standalone `features`
+  command continues to export six-significant-digit text. This intentionally
+  removes the old decimal rounding from clustering and can change results.
 - **Retain buffered feature reads.** Subset selection previously used an
   absolute seek before every selected spike. `BufReader::seek` discards its
   buffer, even if the next row is already there. Relative seeks retain nearby
@@ -64,7 +74,7 @@ they need evidence of a remaining memory bottleneck on each target CPU.
 
 ## Validation of the score changes
 
-The storage-only prototype produced byte-identical labels and identical printed
+Before the direct-f32 feature change, the storage-only prototype produced byte-identical labels and identical printed
 trial scores on three real recordings. With reciprocal scoring enabled, nine
 recordings across three sessions (48,517–704,080 spikes) retained byte-identical
 labels. Development-only traces also matched assignment hashes, full/quick
@@ -75,7 +85,8 @@ not a promise of identical clustering for every recording.
 Validation used private copies of recordings and separate instrumented builds.
 The application and CI do not contain recordings or the validation trace code.
 
-Three-run medians on the local macOS ARM64 machine, with nalgebra, seed 1,
+For the score-storage/reciprocal change, before direct-f32 extraction: three-run
+medians on the local macOS ARM64 machine, with nalgebra, seed 1,
 default fitting settings and one recording at a time:
 
 | Spikes | Total before | Total after | Peak RSS before | Peak RSS after |
@@ -91,6 +102,35 @@ the preceding Rust build with this implementation; they are not Windows timings
 or comparisons against historical C++ KlustaKwik.
 Peak RSS uses per-process OS resource accounting, collected separately from
 the portable timing helper below.
+
+## Direct-f32 feature measurements
+
+Three alternating repetitions per build on macOS ARM64, using nalgebra and
+one file at a time:
+
+| Spikes | Feature preparation before | Feature preparation after | Total before | Total after |
+| ---: | ---: | ---: | ---: | ---: |
+| 48,517 | 0.186 s | 0.097 s | 17.15 s | 15.51 s |
+| 91,242 | 0.350 s | 0.175 s | 8.18 s | 8.01 s |
+| 704,080 | 2.690 s | 1.370 s | 10.59 s | 9.09 s |
+
+Feature preparation includes PCA/projection and cache finalization. Total
+timings also include changed CEM search trajectories, so those total savings
+cannot all be attributed to I/O removal. These inputs use the RAM path.
+
+Across nine real recordings, adjusted Rand agreement with the preceding text
+round-trip ranged from 0.715 to 1.0; seven were at least 0.95 and two were
+byte-identical. Two files selected one fewer signal cluster. The most sensitive
+file retained 21 groups but had agreement 0.715, so this change affects more
+than arbitrary label numbering on some data. These are comparisons between
+two outputs, not ground-truth accuracy measurements.
+
+On that sensitive file, the original and refactored standalone text feature
+exports were byte-identical, isolating the representation change after PCA.
+Synthetic population tests still pass. RAM and disk paths are checked against
+one another exactly, including subset/global bounds, backward/repeated reads,
+partial blocks and feature-column order. Nine-million-spike disk selection is
+tested by sizing metadata without generating a large recording in CI.
 
 ## Measure a recording
 
@@ -126,9 +166,6 @@ I/O and can vary with caching and other workloads.
 
 ## Further candidates
 
-- A direct binary feature-cache pipeline could eliminate the temporary `.fet`
-  write/read cycle. It must preserve the existing six-significant-digit-to-f32
-  conversion, since changing that rounding can alter clustering decisions.
 - Batched likelihood/triangular solves could improve SIMD or BLAS throughput.
   They need tests of numerical error and complete clustering results because
   backend reduction order can differ.

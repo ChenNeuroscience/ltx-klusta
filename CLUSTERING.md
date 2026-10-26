@@ -77,10 +77,13 @@ solves. Multiplication by this reciprocal can round differently from division;
 it preserves the model and solve equations but can change sensitive decisions.
 See [PERFORMANCE.md](PERFORMANCE.md) for measurements and validation.
 
-Numerical compatibility details include six-significant-digit feature text,
-the original reader's conversion to `f32` followed by `f64` arithmetic, global
-min/max normalization, ascending component IDs for ties, and the Windows CRT
-random sequence. BLAS/LAPACK selection affects feature extraction; clustering's
+Clustering casts computed features directly to `f32`, then uses `f64` for
+normalization and clustering arithmetic. It retains global min/max bounds,
+ascending component IDs for ties and the Windows CRT random generator. The
+former six-significant-digit `.fet` round-trip is removed from clustering;
+standalone feature export still uses that text format. More precise feature
+values can change assignments, subsequent RNG consumption and the selected
+model, even with the same initial seed. BLAS/LAPACK selection affects feature extraction; clustering's
 small covariance/Cholesky calculations use Rust on every platform.
 
 There are explicit corrections at invalid or degenerate inputs: constant
@@ -91,19 +94,23 @@ feature set produces only noise. Failures preserve an existing output file.
 
 ## Memory and temporary storage
 
-Only the fitting set and its component scores are held in memory. The
-recording's features and trial labels use private disk files, and full-record
-assignment runs in fixed-size blocks. There is no `N * clusters` allocation
-for the full recording. Scratch directories are unique, including when two
-source folders contain identically named recordings. Files are removed on
-completion or failure; the queue clears interrupted work before retrying it.
+The fitting set and its scores are held in memory. Full-record `f32` features
+also stay in RAM when their total size is at most 64 MiB per file. Above that
+threshold, features stream directly to a little-endian binary cache. A
+12-column cache for nine million spikes is 432 MB (about 412 MiB), so it uses
+the disk path. The threshold bounds feature RAM independently of recording
+length and adds at most 64 MiB per active job to the fitting/PCA working sets.
 
-Feature extraction currently writes temporary `.fet` text, converts it to a
-compact `f32` cache, then removes the text before fitting. Large recordings
-therefore need temporary disk space: a 12-column cache for nine million spikes
-is 432 MB, and the temporary text is larger. `--work-dir` selects another disk.
-Each initial-count trial still classifies the entire recording; bounded RAM
-does not eliminate that computation.
+Both storage paths use the same feature values and full-record normalization
+bounds. Fitting reads only selected spikes; full-record assignment streams
+all rows in order. There is no full-record spikes-by-clusters allocation.
+No temporary `.fet` or count file is created for clustering.
+
+Scratch directories are unique, including when two source folders contain
+identically named recordings. Files are removed on completion/failure, and the
+queue clears interrupted work before retrying. `--work-dir` selects the scratch
+disk. Each initial-count trial still classifies every spike when subsampling;
+bounded RAM does not eliminate that computation.
 
 ## Verification and scientific validation
 
@@ -117,7 +124,8 @@ Routine CI does not generate nine million spikes.
 
 Development checks against historical upstream source, with the Windows RNG
 substituted on macOS, produced identical labels on two synthetic recordings and
-three real recordings (48,517, 91,242 and 704,080 spikes). No legacy source or
+three real recordings (48,517, 91,242 and 704,080 spikes), before removal of the
+six-significant-digit round-trip. No legacy source or
 C++ comparison harness is included in this repository or its CI. These checks
 do not identify the exact source of the customized June 2014 Windows binary
 or establish equivalence for every recording. Review representative

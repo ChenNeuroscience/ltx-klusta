@@ -207,6 +207,14 @@ are omitted. Values have six significant digits in scientific notation.
 The old four-argument top-level invocation has moved to `features`; the old
 batch file should be replaced with the combined `cluster` or `enqueue` operation.
 
+Clustering feeds computed PCA/other features directly into `f32` storage, without
+writing temporary `.fet` text. Feature sets up to 64 MiB per active recording
+stay in RAM; larger ones use a binary cache in the private scratch folder.
+The standalone `features` export retains its text format. Direct `f32` storage
+retains more precision than the former six-significant-digit round-trip and
+can change cluster assignments or the selected model. Pin the build when
+reproducing older results.
+
 ## Numerical backend
 
 | Option | Behaviour |
