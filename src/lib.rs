@@ -4,6 +4,7 @@
 compile_error!("ltxk requires a 64-bit target");
 
 pub mod cluster;
+pub mod concurrency;
 mod dashboard;
 pub mod feature_store;
 pub mod linalg;

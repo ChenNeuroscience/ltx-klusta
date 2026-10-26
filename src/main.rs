@@ -1,5 +1,6 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use ltx_klusta::concurrency::JobCount;
 use ltx_klusta::{pipeline, queue::Queue, Backend, Error, Features, Result, MAX_BLOCK_SPIKES};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
@@ -36,7 +37,7 @@ enum Command {
         #[command(flatten)]
         options: ClusterOptions,
     },
-    /// Queue recordings across independent invocations (four concurrent jobs by default)
+    /// Queue recordings across independent invocations (automatic CPU budget by default)
     Enqueue {
         #[arg(required = true, num_args = 1.., value_hint = clap::ValueHint::FilePath)]
         inputs: Vec<PathBuf>,
@@ -54,8 +55,9 @@ enum Command {
     },
     /// Resume queued or interrupted jobs after a coordinator exits
     Resume {
-        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
-        jobs: u32,
+        /// Maximum simultaneous recordings: auto or 1–16 (default: ltxk.json or auto)
+        #[arg(long, value_name = "AUTO|N")]
+        jobs: Option<JobCount>,
         /// Show a live dashboard (plain logs without a terminal); keep it open at completion
         #[arg(long)]
         console: bool,
@@ -143,9 +145,9 @@ struct ClusterOptions {
     /// Maximum CEM iterations per fit (default: 10000)
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100_000))]
     max_iterations: Option<u32>,
-    /// Maximum simultaneous recordings (default: 4)
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=16))]
-    jobs: Option<u32>,
+    /// Maximum simultaneous recordings: auto or 1–16 (default: auto)
+    #[arg(long, value_name = "AUTO|N")]
+    jobs: Option<JobCount>,
     /// Replace existing .clu.N files (otherwise skip them)
     #[arg(long)]
     force: bool,
@@ -183,7 +185,7 @@ impl ClusterOptions {
             settings.cluster.max_iterations = value as usize;
         }
         if let Some(value) = self.jobs {
-            settings.jobs = value as usize;
+            settings.jobs = value.0;
         }
         if self.force {
             settings.force = true;
@@ -303,14 +305,18 @@ fn run(cli: Cli) -> Result<Exit> {
             queue_dir,
         }) => {
             let queue = queue(queue_dir)?;
+            let jobs = match jobs {
+                Some(jobs) => jobs.0,
+                None => {
+                    let settings = pipeline::Settings::load(None)?;
+                    settings.validate()?;
+                    settings.jobs
+                }
+            };
             if console {
-                return console_result(queue.console(
-                    jobs as usize,
-                    &[],
-                    &mut std::io::stderr(),
-                )?);
+                return console_result(queue.console(jobs, &[], &mut std::io::stderr())?);
             }
-            if queue.drain(jobs as usize, &mut std::io::stderr())? {
+            if queue.drain(jobs, &mut std::io::stderr())? {
                 Err(Error::Invalid(
                     "Some queued jobs failed; use ltxk status for details",
                 ))

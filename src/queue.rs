@@ -230,7 +230,7 @@ impl Queue {
     /// final empty check and unlock happen under the admission lock, closing
     /// the race between a new submission and an idle coordinator exiting.
     pub fn drain(&self, limit: usize, log: &mut dyn Write) -> Result<bool> {
-        let mut progress = Progress::new(self, &[], false)?;
+        let mut progress = Progress::new(self, &[], false, limit)?;
         Ok(self
             .drain_inner(limit, log, &mut progress, true)?
             .unwrap_or(false))
@@ -261,7 +261,7 @@ impl Queue {
             "ltx-klusta queue\nKeep this window open while processing.\nLogs: {}",
             self.root.join("logs").display()
         )?;
-        let mut progress = Progress::new(self, requested, true)?;
+        let mut progress = Progress::new(self, requested, true, limit)?;
         // Keep coordinator messages away from the alternate-screen dashboard.
         let mut session_log = OpenOptions::new()
             .create(true)

@@ -68,9 +68,15 @@ pub(crate) struct Progress {
     heartbeat: Instant,
     title: bool,
     dashboard: Option<Dashboard>,
+    limit: usize,
 }
 impl Progress {
-    pub(crate) fn new(queue: &Queue, requested: &[String], title: bool) -> Result<Self> {
+    pub(crate) fn new(
+        queue: &Queue,
+        requested: &[String],
+        title: bool,
+        limit: usize,
+    ) -> Result<Self> {
         let ignored = queue
             .records()?
             .into_iter()
@@ -87,6 +93,7 @@ impl Progress {
             heartbeat: Instant::now(),
             title,
             dashboard: if title { Dashboard::try_new() } else { None },
+            limit,
         })
     }
 
@@ -119,7 +126,7 @@ impl Progress {
             self.last_counts = Some(counts);
             dashboard.update(
                 &jobs,
-                &counts.description(),
+                &format!("{} workers max · {}", self.limit, counts.description()),
                 &queue.root.join("logs"),
                 false,
             )?;
@@ -217,7 +224,7 @@ impl Progress {
         if let Some(dashboard) = &mut self.dashboard {
             while !dashboard.update(
                 &jobs,
-                &self.counts.description(),
+                &format!("{} workers max · {}", self.limit, self.counts.description()),
                 &queue.root.join("logs"),
                 true,
             )? {

@@ -17,6 +17,7 @@ pub struct Settings {
     pub backend: Backend,
     pub lapack_library: Option<PathBuf>,
     pub block_spikes: usize,
+    #[serde(deserialize_with = "crate::concurrency::deserialize_jobs")]
     pub jobs: usize,
     pub force: bool,
     pub work_dir: Option<PathBuf>,
@@ -29,7 +30,7 @@ impl Default for Settings {
             backend: Backend::Nalgebra,
             lapack_library: None,
             block_spikes: DEFAULT_BLOCK_SPIKES,
-            jobs: 4,
+            jobs: crate::concurrency::default_jobs(),
             force: false,
             work_dir: None,
         }
