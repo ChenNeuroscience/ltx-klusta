@@ -50,8 +50,10 @@ channels, for 12 numbers. A signal cluster is an ellipsoid in that feature
 space. Its mean is the center; its covariance describes the spread and
 correlations, allowing tilted ellipsoids.
 
-1. **Fit the current groups (M-step).** Count their spikes, recompute each mean
-   and unbiased covariance, and set the component weights from their sizes.
+1. **Fit the current groups (M-step).** Calculate each group's count, mean and
+   unbiased covariance, and set its weight from its size. Small membership
+   changes update retained centered totals using only the moved spikes;
+   larger changes and periodic refreshes use a full fit.
 2. **Score spikes (E-step).** For each valid signal cluster, factor its
    covariance as `L Lᵀ`. Solve `L z = spike - mean` and evaluate
    `dot(z,z)/2 + sum(log(diag(L))) - log(weight) + D*log(2π)/2`.
@@ -76,6 +78,13 @@ The common 3/12-feature scoring kernels cache `1 / L[i,i]` for their triangular
 solves. Multiplication by this reciprocal can round differently from division;
 it preserves the model and solve equations but can change sensitive decisions.
 See [PERFORMANCE.md](PERFORMANCE.md) for measurements and validation.
+
+Incremental means/covariances use algebraic updates to the same statistics;
+they do not approximate a moved spike or freeze a changing cluster. Centered
+totals avoid subtracting large raw second moments. Full fits refresh them at
+least every 20 M-steps, and a failed incremental Cholesky check retries the
+original full fit before considering the component singular. Different
+floating-point accumulation can still change sensitive clustering decisions.
 
 Clustering casts computed features directly to `f32`, then uses `f64` for
 normalization and clustering arithmetic. It retains global min/max bounds,

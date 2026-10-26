@@ -46,6 +46,13 @@ trajectory and final model; see the separate results below.
   are still recomputed whenever the cluster changes. This uses full-precision
   division to construct the reciprocal, with no hardware reciprocal estimate.
   Feature normalization and covariance estimation keep their existing divisions.
+- **Update cluster statistics incrementally.** Retain counts and centered sums
+  between M-steps and adjust them for spikes entering/leaving each group.
+  Keep membership history separate from the quick E-step's history. Rebuild
+  when more than one eighth of assignments change, a component is revived,
+  an incremental Cholesky check fails, or 20 M-steps have elapsed. Recursive
+  fits start with fresh statistics. This changes floating-point accumulation,
+  while retaining the same mean and unbiased covariance equations.
 
 Numerical checks cover analytic correlated Gaussians, close agreement of the
 reciprocal kernels with the division-based generic solve, covariance agreement
@@ -131,6 +138,81 @@ Synthetic population tests still pass. RAM and disk paths are checked against
 one another exactly, including subset/global bounds, backward/repeated reads,
 partial blocks and feature-column order. Nine-million-spike disk selection is
 tested by sizing metadata without generating a large recording in CI.
+
+## Incremental cluster statistics
+
+For a cluster with count `n`, center `mu` and centered scatter
+`S = sum((x-mu)(x-mu)^T)`, retain `n`, `mu` and `S`. For the entering/leaving
+spikes, calculate signed totals about the **old** center:
+
+```
+delta_n = number_entering - number_leaving
+delta_s = sum_entering(x-mu) - sum_leaving(x-mu)
+delta_Q = sum_entering((x-mu)(x-mu)^T) - sum_leaving((x-mu)(x-mu)^T)
+n_new = n + delta_n
+mu_new = mu + delta_s / n_new
+S_new = S + delta_Q - delta_s * delta_s^T / n_new
+cov_new = S_new / (n_new - 1)
+```
+
+These are algebraic identities, rather than a different covariance estimator.
+Centered updates avoid the cancellation of `sum(x*x) - sum(x)*sum(x)/n`;
+see [Pebay's centered-moment formulas](https://www.sandia.gov/research/publications/details/formulas-for-robust-one-pass-parallel-computation-of-covariances-and-arbitr-2008-09-01/).
+An assignment scan still costs `O(N)`; the quadratic feature work falls from
+`O(N*D*D)` to `O(moved*D*D + affected_clusters*D*D)`. Covariance factorizations
+and the existing E-step are retained. Noise weights and small-group deletion
+rules are unchanged. No diagonal jitter or covariance regularization is added.
+
+Full fits and periodic refreshes limit accumulated rounding error. Reusing a
+deleted ID forces a fresh fit; a failed downdate is recomputed from members
+before the existing singular-component rule is applied. Tests compare fresh
+and incremental fits through exchanges, noise moves, deletion/revival, small
+variance around a large center, and singular downdates. Close floating-point
+agreement does not promise identical decisions for all recordings.
+
+Three alternating repetitions on the same macOS ARM64 machine, nalgebra,
+seed 1 and default fitting settings, compared with the direct-f32 build:
+
+| Spikes | Total before (median) | Total after (median) |
+| ---: | ---: | ---: |
+| 48,517 | 15.26 s | 14.76 s |
+| 91,242 | 8.23 s | 7.29 s |
+| 704,080 | 9.14 s | 8.68 s |
+
+The three recordings retained byte-identical labels and trial cluster/noise
+counts. Printed trial scores differed by at most about `3e-8`. These are modest
+whole-program gains, and timings vary: the first reference run on 48,517 spikes
+took 26.50 s, versus about 15.25 s on the other two runs; it remains included in
+the median. This is not a Windows performance measurement.
+
+Six additional real recordings from the same three sessions also retained
+byte-identical labels. Each was compared once per build; their timings are
+validation observations rather than repeated performance estimates.
+
+### Extending incremental computation to likelihoods
+
+A single spike addition/removal changes covariance by a scaling and a rank-one
+update. The inverse-covariance identity can correct a cached squared
+Mahalanobis distance using a dot product, `O(D)` work instead of a fresh
+`O(D*D)` triangular solve. Several moves require several corrections and
+eventually favor a fresh solve. These are exact algebraic identities, but
+removals near singularity need care; see the original
+[LINPACK downdate routine](https://netlib.org/linpack/dchdd.f).
+
+A development-only prototype matched fresh likelihoods within about `1.3e-13`
+absolute error in well-conditioned 1/3/12-dimensional addition/removal checks.
+It is **not enabled** in the clustering loop. In separate instrumented fits of
+the three real recordings above, only about 8% of Gaussian evaluations followed
+1-3 membership changes in that component. About 6-14% followed no membership
+changes; most followed 12 or more, or an initial/proposal fit. These fractions
+describe evaluated spike/component pairs, not whole-program time.
+
+The quick E-step deliberately retains older scores for some spikes. A partial
+distance update must know which model produced each cached value, and keep
+that historical-score behavior intact. Further work therefore needs explicit
+cache freshness tracking, fresh solves when updates are unsafe or uneconomical,
+and real-recording measurements. The prototype does not establish a large
+end-to-end gain from rank-one likelihood corrections.
 
 ## Measure a recording
 

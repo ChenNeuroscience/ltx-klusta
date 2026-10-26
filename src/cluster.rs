@@ -191,6 +191,39 @@ struct State {
     scores: Vec<f64>,
 }
 
+// Memberships and centered sums at the last M-step, independent of old_class
+// (which belongs to the quick E-step). A CEM invocation owns its own cache, so
+// reinitializing a split fit never reuses the preceding fit's statistics.
+#[derive(Default)]
+struct Moments {
+    class: Vec<usize>,
+    counts: Vec<usize>,
+    scatter: Vec<f64>,
+    valid: Vec<bool>,
+    changes: Vec<(usize, usize, usize)>,
+    age: usize,
+}
+
+fn adjust_moments_fixed<const D: usize>(
+    point: &[f64],
+    mean: &[f64],
+    sum: &mut [f64],
+    scatter: &mut [f64],
+    sign: f64,
+) {
+    let point: &[f64; D] = point.try_into().unwrap();
+    let mean: &[f64; D] = mean.try_into().unwrap();
+    let sum: &mut [f64; D] = sum.try_into().unwrap();
+    let scatter: &mut [[f64; D]; D] = scatter.as_chunks_mut::<D>().0.try_into().unwrap();
+    let delta: [f64; D] = std::array::from_fn(|i| point[i] - mean[i]);
+    for i in 0..D {
+        sum[i] += sign * delta[i];
+        for j in i..D {
+            scatter[i][j] += sign * delta[i] * delta[j];
+        }
+    }
+}
+
 fn accumulate_cov_fixed<const D: usize>(point: &[f64], mean: &[f64], cov: &mut [f64]) {
     let point: &[f64; D] = point.try_into().unwrap();
     let mean: &[f64; D] = mean.try_into().unwrap();
@@ -243,6 +276,10 @@ impl State {
     }
 
     fn m_step(&mut self) {
+        self.m_step_full(None);
+    }
+
+    fn m_step_full(&mut self, cache: Option<&mut Moments>) {
         let (n, d) = (self.data.points, self.data.dims);
         let mut counts = [0_usize; MAX_CLUSTERS];
         self.mean.fill(0.);
@@ -297,11 +334,111 @@ impl State {
                 }
             }
         }
+        if let Some(cache) = cache {
+            cache.class.clone_from(&self.class);
+            cache.counts.clear();
+            cache.counts.extend_from_slice(&counts);
+            // Most recursive fits have only one or two signal components.
+            // Retain only the prefix containing members, rather than copying
+            // the storage reserved for all 100 possible component IDs.
+            let columns = counts.iter().rposition(|&n| n > 0).unwrap_or(0) + 1;
+            cache.scatter.clear();
+            cache
+                .scatter
+                .extend_from_slice(&self.cov[..columns * d * d]);
+            cache.valid.clone_from(&self.alive);
+            cache.age = 0;
+        }
         for &c in ids.iter().skip(1) {
             for value in &mut self.cov[c * d * d..(c + 1) * d * d] {
                 *value /= (counts[c] - 1) as f64;
             }
         }
+    }
+
+    fn m_step_incremental(&mut self, cache: &mut Moments) {
+        let (n, d) = (self.data.points, self.data.dims);
+        if cache.class.is_empty() || cache.age >= 19 {
+            self.m_step_full(Some(cache));
+            return;
+        }
+        cache.changes.clear();
+        for (p, (&old, &new)) in cache.class.iter().zip(&self.class).enumerate() {
+            if old != new {
+                cache.changes.push((p, old, new));
+                // Updates are useful only for small changes. New/revived
+                // groups and ill-conditioned downdates get the original fit.
+                if cache.changes.len() > n / 8 || (new != 0 && self.alive[new] && !cache.valid[new])
+                {
+                    self.m_step_full(Some(cache));
+                    return;
+                }
+            }
+        }
+        cache.age += 1;
+        if cache.changes.is_empty() {
+            return;
+        }
+        let mut delta_sum = vec![0.; MAX_CLUSTERS * d];
+        let mut affected = [false; MAX_CLUSTERS];
+        for &(p, old, new) in &cache.changes {
+            let point = self.data.row(p);
+            cache.counts[old] -= 1;
+            cache.counts[new] += 1;
+            for (c, sign) in [(old, -1.), (new, 1.)] {
+                affected[c] = true;
+                if c == 0 || !cache.valid[c] {
+                    continue;
+                }
+                let mean = &self.mean[c * d..(c + 1) * d];
+                let sum = &mut delta_sum[c * d..(c + 1) * d];
+                let scatter = &mut cache.scatter[c * d * d..(c + 1) * d * d];
+                match d {
+                    3 => adjust_moments_fixed::<3>(point, mean, sum, scatter, sign),
+                    12 => adjust_moments_fixed::<12>(point, mean, sum, scatter, sign),
+                    _ => {
+                        for i in 0..d {
+                            let delta_i = point[i] - mean[i];
+                            sum[i] += sign * delta_i;
+                            for j in i..d {
+                                scatter[i * d + j] += sign * delta_i * (point[j] - mean[j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for c in 1..MAX_CLUSTERS {
+            if cache.counts[c] <= d {
+                self.alive[c] = false;
+            }
+            if !self.alive[c] || !affected[c] {
+                continue;
+            }
+            let count = cache.counts[c] as f64;
+            let sum = &delta_sum[c * d..(c + 1) * d];
+            let mean = &mut self.mean[c * d..(c + 1) * d];
+            let scatter = &mut cache.scatter[c * d * d..(c + 1) * d * d];
+            let cov = &mut self.cov[c * d * d..(c + 1) * d * d];
+            for i in 0..d {
+                mean[i] += sum[i] / count;
+                for j in i..d {
+                    // Both delta sums use the OLD center. Recenter only once,
+                    // after all additions/removals, avoiding raw E[x*x]-E[x]^2.
+                    scatter[i * d + j] -= sum[i] * sum[j] / count;
+                    cov[i * d + j] = scatter[i * d + j] / (count - 1.);
+                }
+            }
+            if cholesky(cov, d).is_none() {
+                self.m_step_full(Some(cache));
+                return;
+            }
+        }
+        for c in self.ids() {
+            self.weight[c] = (cache.counts[c] + usize::from(c == 0)) as f64 / (n + 1) as f64;
+        }
+        cache.class.clone_from(&self.class);
+        cache.valid.clone_from(&self.alive);
     }
 
     fn gaussian(&self, c: usize) -> Option<Gaussian> {
@@ -437,9 +574,10 @@ impl State {
         let mut score = f64::INFINITY;
         let mut full = true;
         let mut previous = vec![0; self.class.len()];
+        let mut moments = Moments::default();
         for iteration in 1..=options.max_iterations {
             previous.copy_from_slice(&self.class);
-            self.m_step();
+            self.m_step_incremental(&mut moments);
             self.e_step(full);
             if !self.c_step(noise) {
                 return Ok(f64::INFINITY);
@@ -921,6 +1059,147 @@ mod tests {
                     let expected = (sum_ij - sum_i * sum_j / points as f64) / (points - 1) as f64;
                     assert!((state.cov[dims * dims + i * dims + j] - expected).abs() < 1e-12);
                 }
+            }
+        }
+    }
+
+    fn assert_same_moments(actual: &State, expected: &State, tolerance: f64) {
+        assert_eq!(actual.alive, expected.alive);
+        let d = actual.data.dims;
+        for c in actual.ids() {
+            assert_eq!(actual.weight[c], expected.weight[c]);
+            if c == 0 {
+                continue;
+            }
+            for i in 0..d {
+                assert!((actual.mean[c * d + i] - expected.mean[c * d + i]).abs() < tolerance);
+                for j in i..d {
+                    let k = c * d * d + i * d + j;
+                    assert!(
+                        (actual.cov[k] - expected.cov[k]).abs() < tolerance,
+                        "cluster {c}, ({i},{j}): {} versus {}",
+                        actual.cov[k],
+                        expected.cov[k]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_moments_match_fresh_fits_after_exchanges_and_noise_moves() {
+        for dims in [1, 3, 7, 12] {
+            let points = 512;
+            let data = Arc::new(Data {
+                points,
+                dims,
+                values: (0..points * dims)
+                    .map(|i| ((i * 37 + i / dims * 19) % 101) as f64 / 100.)
+                    .collect(),
+            });
+            let mut updated = State::new(Arc::clone(&data));
+            let mut fresh = State::new(data);
+            updated.class = (0..points).map(|i| 1 + i % 2).collect();
+            updated.alive[1..3].fill(true);
+            let mut cache = Moments::default();
+            for iteration in 0..100 {
+                if iteration > 0 {
+                    let p = iteration * 37 % points;
+                    updated.class[p] = (updated.class[p] + 1) % 3;
+                    // This includes exchanging spikes without changing counts.
+                    let q = (p + 1) % points;
+                    updated.class[q] = 3 - updated.class[q].max(1);
+                }
+                fresh.class.clone_from(&updated.class);
+                fresh.alive.clone_from(&updated.alive);
+                updated.m_step_incremental(&mut cache);
+                fresh.m_step();
+                assert_same_moments(&updated, &fresh, 2e-14);
+                assert_eq!(cache.class, updated.class);
+                assert!(cache.age < 20);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_moments_refresh_after_deletion_revival_and_reinitialization() {
+        let points = 200;
+        let data = Arc::new(Data {
+            points,
+            dims: 1,
+            values: (0..points).map(|p| (p * 37 % 101) as f64 / 100.).collect(),
+        });
+        let mut state = State::new(Arc::clone(&data));
+        state.class = (0..points).map(|p| 1 + usize::from(p < 5)).collect();
+        state.alive[1..3].fill(true);
+        let mut cache = Moments::default();
+        state.m_step_incremental(&mut cache);
+        state.class[..5].fill(1);
+        state.alive[2] = false;
+        state.m_step_incremental(&mut cache);
+        assert!(!cache.valid[2]);
+        // A split can reuse a deleted ID, possibly including an old member.
+        state.class[..5].fill(2);
+        state.alive[2] = true;
+        state.m_step_incremental(&mut cache);
+        assert_eq!(cache.age, 0);
+        let mut fresh = State::new(data);
+        fresh.class.clone_from(&state.class);
+        fresh.alive.clone_from(&state.alive);
+        fresh.m_step();
+        assert_same_moments(&state, &fresh, f64::EPSILON);
+        state.initialize(4, &mut Random(1));
+        state.m_step_incremental(&mut cache);
+        assert_eq!(cache.age, 0);
+        assert_eq!(cache.class, state.class);
+    }
+
+    #[test]
+    fn incremental_downdate_rebuilds_before_discarding_a_singular_cluster() {
+        let mut state = State::new(Arc::new(Data {
+            points: 100,
+            dims: 1,
+            values: (0..100).map(|p| f64::from(p == 0)).collect(),
+        }));
+        state.class.fill(1);
+        state.alive[1] = true;
+        let mut cache = Moments::default();
+        state.m_step_incremental(&mut cache);
+        state.class[0] = 0;
+        // Force a small negative downdate remainder; a fresh covariance is zero.
+        cache.scatter[1] -= 1e-12;
+        state.m_step_incremental(&mut cache);
+        assert_eq!(cache.age, 0);
+        assert_eq!(state.cov[1], 0.);
+        assert!(state.alive[1]);
+        state.e_step(true);
+        assert!(!state.alive[1]);
+    }
+
+    #[test]
+    fn incremental_moments_keep_small_variances_around_a_large_center() {
+        let points = 256;
+        let data = Arc::new(Data {
+            points,
+            dims: 1,
+            values: (0..points)
+                .map(|p| 0.75 + (p * 37 % 101) as f64 * 1e-10)
+                .collect(),
+        });
+        let mut updated = State::new(Arc::clone(&data));
+        updated.class = (0..points).map(|p| 1 + p % 2).collect();
+        updated.alive[1..3].fill(true);
+        let mut fresh = State::new(data);
+        let mut cache = Moments::default();
+        for iteration in 0..100 {
+            updated.class[iteration] = 3 - updated.class[iteration];
+            updated.m_step_incremental(&mut cache);
+            fresh.class.clone_from(&updated.class);
+            fresh.alive.clone_from(&updated.alive);
+            fresh.m_step();
+            for c in 1..3 {
+                assert!((updated.mean[c] - fresh.mean[c]).abs() < 2e-15);
+                assert!((updated.cov[c] / fresh.cov[c] - 1.).abs() < 2e-6);
             }
         }
     }
