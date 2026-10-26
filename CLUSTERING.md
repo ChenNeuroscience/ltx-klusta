@@ -43,6 +43,40 @@ future algorithm improvements, but they should be evaluated separately.
 The cap is 100 components including noise, matching the supplied Windows binary.
 The classic `PriorPoint` setting only affected distributional mode and is absent.
 
+### Follow one iteration
+
+Each spike is a short feature vector: normally three PCs from each of four
+channels, for 12 numbers. A signal cluster is an ellipsoid in that feature
+space. Its mean is the center; its covariance describes the spread and
+correlations, allowing tilted ellipsoids.
+
+1. **Fit the current groups (M-step).** Count their spikes, recompute each mean
+   and unbiased covariance, and set the component weights from their sizes.
+2. **Score spikes (E-step).** For each valid signal cluster, factor its
+   covariance as `L Lᵀ`. Solve `L z = spike - mean` and evaluate
+   `dot(z,z)/2 + sum(log(diag(L))) - log(weight) + D*log(2π)/2`.
+   A smaller score is a better match. The uniform noise class has its own score.
+   Log terms and the factorization are shared by all spikes in that update.
+3. **Assign groups (C-step).** Give each spike to the component with the lowest
+   score and remember its runner-up. Assignments are hard: one group per spike.
+4. **Consider a deletion.** Estimate the cost of moving a group's spikes to
+   their runner-up groups. Delete the best candidate when that cost is smaller
+   than the reduction in the BIC complexity penalty.
+5. **Periodically try splits.** Fit one and two signal groups to a candidate
+   cluster, then evaluate a promising split in the full fitting model. Accept
+   it using the classic penalized-score comparison and repeat the main loop.
+
+Convergence requires unchanged assignments after a full scoring step and no
+accepted split. Quick steps reuse some old scores under the original rule;
+periodic full steps refresh them. Each initial-count trial performs this search
+on its own subset. Its fitted model then assigns the full recording when
+subsampling is in use, and the best full-record penalized score wins.
+
+The common 3/12-feature scoring kernels cache `1 / L[i,i]` for their triangular
+solves. Multiplication by this reciprocal can round differently from division;
+it preserves the model and solve equations but can change sensitive decisions.
+See [PERFORMANCE.md](PERFORMANCE.md) for measurements and validation.
+
 Numerical compatibility details include six-significant-digit feature text,
 the original reader's conversion to `f32` followed by `f64` arithmetic, global
 min/max normalization, ascending component IDs for ties, and the Windows CRT
@@ -81,12 +115,12 @@ block sizes, Unicode paths, atomic replacement, and concurrent queue recovery.
 Windows and macOS run these checks with pure Rust and optional runtime LAPACK.
 Routine CI does not generate nine million spikes.
 
-A development-only check against historical upstream source, with the Windows
-RNG substituted on macOS, produced identical labels on two synthetic recordings
-(1,200 spikes with full fitting and 1,201 spikes with stride 4). No legacy source
-or comparison harness is included in this repository or its CI. This check
-does not identify the exact source of the customized June 2014 Windows binary
-or establish identical results on real recordings. Review representative
+Development checks against historical upstream source, with the Windows RNG
+substituted on macOS, produced identical labels on two synthetic recordings and
+three real recordings (48,517, 91,242 and 704,080 spikes). No legacy source or
+C++ comparison harness is included in this repository or its CI. These checks
+do not identify the exact source of the customized June 2014 Windows binary
+or establish equivalence for every recording. Review representative
 recordings before adopting the new clustering implementation for analysis;
 label numbers and results can also vary across floating-point backends.
 

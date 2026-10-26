@@ -224,8 +224,8 @@ cargo test --release covariance_block_benchmark -- --ignored --nocapture
 ```
 
 Repeated eigenvalues can yield different valid PCA bases, and floating-point
-differences can affect later clustering decisions. Pin the numerical backend
-and seed when reproducibility matters.
+differences can affect later clustering decisions. Pin the build, numerical
+backend and seed when reproducibility matters.
 
 ## Windows 11 context menu
 
