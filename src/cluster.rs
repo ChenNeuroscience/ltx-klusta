@@ -97,6 +97,7 @@ struct Gaussian {
     id: usize,
     mean: Vec<f64>,
     lower: Vec<f64>,
+    inverse_diagonal: Vec<f64>,
     offset: f64,
 }
 impl Gaussian {
@@ -109,10 +110,12 @@ impl Gaussian {
             .sum();
         let offset = log_root_det - weight.ln()
             + f64::from((2.0 * std::f64::consts::PI).ln() as f32) * dims as f64 / 2.0;
+        let inverse_diagonal = (0..dims).map(|i| 1.0 / lower[i * dims + i]).collect();
         Some(Self {
             id,
             mean: mean.to_vec(),
             lower,
+            inverse_diagonal,
             offset,
         })
     }
@@ -125,11 +128,13 @@ impl Gaussian {
         }
     }
 
-    // Common 3PC dimensions let LLVM remove loop bounds and unroll the
-    // triangular solve. Keep the dynamic path's arithmetic order unchanged.
+    // Common 3PC dimensions let LLVM remove loop bounds and unroll the solve.
+    // Cached reciprocal diagonals replace repeated divisions. All reductions
+    // retain their order, but each reciprocal multiplication can round differently.
     fn score_fixed<const D: usize>(&self, point: &[f64], root: &mut [f64]) -> f64 {
         let mean: &[f64; D] = self.mean.as_slice().try_into().unwrap();
         let lower: &[[f64; D]; D] = self.lower.as_chunks::<D>().0.try_into().unwrap();
+        let inverse_diagonal: &[f64; D] = self.inverse_diagonal.as_slice().try_into().unwrap();
         let point: &[f64; D] = point.try_into().unwrap();
         let root: &mut [f64; D] = root.try_into().unwrap();
         for i in 0..D {
@@ -137,7 +142,7 @@ impl Gaussian {
             for (j, &previous) in root[..i].iter().enumerate() {
                 value -= lower[i][j] * previous;
             }
-            root[i] = value / lower[i][i];
+            root[i] = value * inverse_diagonal[i];
         }
         root.iter().map(|x| x * x).sum::<f64>() / 2.0 + self.offset
     }
@@ -181,6 +186,8 @@ struct State {
     weight: Vec<f64>,
     mean: Vec<f64>,
     cov: Vec<f64>,
+    // Cluster-major columns: the E-step streams one cluster's scores at a time.
+    // Grow on demand and retain old columns for the historical quick E-step.
     scores: Vec<f64>,
 }
 
@@ -208,7 +215,14 @@ impl State {
             weight: vec![0.; MAX_CLUSTERS],
             mean: vec![0.; MAX_CLUSTERS * d],
             cov: vec![0.; MAX_CLUSTERS * d * d],
-            scores: vec![f64::INFINITY; MAX_CLUSTERS * n],
+            scores: Vec::new(),
+        }
+    }
+
+    fn ensure_score_columns(&mut self, columns: usize) {
+        let length = columns * self.data.points;
+        if length > self.scores.len() {
+            self.scores.resize(length, f64::INFINITY);
         }
     }
 
@@ -219,6 +233,7 @@ impl State {
     }
 
     fn initialize(&mut self, starting: usize, random: &mut Random) {
+        self.ensure_score_columns(starting);
         for class in &mut self.class {
             *class = random.inclusive(1, starting - 1);
         }
@@ -304,47 +319,56 @@ impl State {
     }
 
     fn e_step(&mut self, full: bool) {
+        let n = self.data.points;
+        let ids = self.ids();
+        self.ensure_score_columns(ids.last().unwrap() + 1);
         let noise = self.noise_score();
-        for scores in self.scores.as_chunks_mut::<MAX_CLUSTERS>().0 {
-            scores[0] = noise;
-        }
+        self.scores[..n].fill(noise);
         let mut root = vec![0.; self.data.dims];
-        for c in self.ids().into_iter().skip(1) {
+        for c in ids.into_iter().skip(1) {
             let Some(gaussian) = self.gaussian(c) else {
                 // Reindex immediately; never assign a point to a singular class
                 // using stale likelihoods, as the old implementation could do.
                 self.alive[c] = false;
                 continue;
             };
-            for p in 0..self.data.points {
-                let scores = &mut self.scores[p * MAX_CLUSTERS..(p + 1) * MAX_CLUSTERS];
-                if !full
-                    && self.class[p] == self.old_class[p]
-                    && scores[c] - scores[self.class[p]] > 1000_f64.ln()
+            if full {
+                for (p, score) in self.scores[c * n..(c + 1) * n].iter_mut().enumerate() {
+                    *score = gaussian.score(self.data.row(p), &mut root);
+                }
+                continue;
+            }
+            for p in 0..n {
+                if self.class[p] == self.old_class[p]
+                    && self.scores[c * n + p] - self.scores[self.class[p] * n + p] > 1000_f64.ln()
                 {
                     continue;
                 }
-                scores[c] = gaussian.score(self.data.row(p), &mut root);
+                self.scores[c * n + p] = gaussian.score(self.data.row(p), &mut root);
             }
         }
     }
 
     fn c_step(&mut self, noise: bool) -> bool {
-        let ids = self.ids();
-        let candidates = &ids[usize::from(!noise)..];
+        let n = self.data.points;
+        let candidates: Vec<_> = self
+            .ids()
+            .into_iter()
+            .skip(usize::from(!noise))
+            .map(|c| (c, &self.scores[c * n..(c + 1) * n]))
+            .collect();
         if candidates.is_empty() {
             return false;
         }
         for p in 0..self.data.points {
             self.old_class[p] = self.class[p];
-            let scores = &self.scores[p * MAX_CLUSTERS..(p + 1) * MAX_CLUSTERS];
             let (mut best, mut second) = ((0, f64::INFINITY), (0, f64::INFINITY));
-            for &c in candidates {
-                if scores[c] < best.1 {
+            for &(c, scores) in &candidates {
+                if scores[p] < best.1 {
                     second = best;
-                    best = (c, scores[c]);
-                } else if scores[c] < second.1 {
-                    second = (c, scores[c]);
+                    best = (c, scores[p]);
+                } else if scores[p] < second.1 {
+                    second = (c, scores[p]);
                 }
             }
             self.class[p] = best.0;
@@ -359,9 +383,9 @@ impl State {
             return false;
         }
         let mut losses = [0.; MAX_CLUSTERS];
+        let n = self.data.points;
         for (p, &c) in self.class.iter().enumerate() {
-            let scores = &self.scores[p * MAX_CLUSTERS..(p + 1) * MAX_CLUSTERS];
-            losses[c] += scores[self.second[p]] - scores[c];
+            losses[c] += self.scores[self.second[p] * n + p] - self.scores[c * n + p];
         }
         let candidate = *ids
             .iter()
@@ -387,7 +411,7 @@ impl State {
             if c > 0 && !self.alive[c] {
                 return f64::INFINITY;
             }
-            score += self.scores[p * MAX_CLUSTERS + c];
+            score += self.scores[c * self.data.points + p];
         }
         score
     }
@@ -516,6 +540,7 @@ impl State {
             // As in classic KlustaKwik, score the proposed assignments without
             // a C-step, against the score at the beginning of this split pass.
             if proposal.score() < baseline {
+                self.ensure_score_columns(proposal.scores.len() / self.data.points);
                 self.class = proposal.class;
                 self.alive = proposal.alive;
                 did_split = true;
@@ -696,6 +721,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn score_columns_grow_without_discarding_quick_step_history() {
+        let mut state = State::new(Arc::new(Data {
+            dims: 1,
+            points: 2,
+            values: vec![0., 1.],
+        }));
+        state.ensure_score_columns(2);
+        state
+            .scores
+            .copy_from_slice(&[-0.0, 1.25, f64::INFINITY, -7.]);
+        let original: Vec<_> = state.scores.iter().map(|x| x.to_bits()).collect();
+        state.ensure_score_columns(4);
+        assert_eq!(
+            state.scores[..4]
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            original
+        );
+        assert!(state.scores[4..].iter().all(|&x| x == f64::INFINITY));
+        state.ensure_score_columns(1);
+        assert_eq!(state.scores.len(), 8);
+    }
+
+    #[test]
+    fn column_scores_keep_ascending_ties_and_noise_exclusion() {
+        let mut state = State::new(Arc::new(Data {
+            dims: 1,
+            points: 3,
+            values: vec![0.; 3],
+        }));
+        state.alive[1..3].fill(true);
+        state.ensure_score_columns(3);
+        state
+            .scores
+            .copy_from_slice(&[1., 5., 0., 1., 2., 3., 1., 1., 3.]);
+        assert!(state.c_step(true));
+        assert_eq!(state.class, [0, 2, 0]);
+        assert_eq!(state.second, [1, 1, 1]);
+        let expected = ((penalty(3, 1, 3) + 1.) + 1.) + 0.;
+        assert_eq!(state.score().to_bits(), expected.to_bits());
+        assert!(state.c_step(false));
+        assert_eq!(state.class, [1, 2, 1]);
+        assert_eq!(state.second, [2, 1, 2]);
+    }
+
+    #[test]
     fn subset_counts_cross_large_recordings_without_allocating_them() {
         assert_eq!(sampling_plan(9_000_000, 25_000), (360, 25_000));
         assert_eq!(sampling_plan(49_999, 25_000), (1, 49_999));
@@ -730,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn specialized_gaussians_preserve_scores_and_solve_correlated_systems() {
+    fn specialized_gaussians_match_division_reference_and_correlated_systems() {
         let mut random = Random(425);
         for dims in [3, 12] {
             let mean = vec![0.5; dims];
@@ -767,10 +839,30 @@ mod tests {
                     .collect();
                 let actual = gaussian.score(&point, &mut vec![0.; dims]);
                 let fallback = gaussian.score_dynamic(&point, &mut vec![0.; dims]);
-                assert_eq!(actual.to_bits(), fallback.to_bits());
+                assert!((actual - fallback).abs() <= 16. * f64::EPSILON * (1. + fallback.abs()));
                 let expected = z.iter().map(|x| x * x).sum::<f64>() / 2. + offset;
                 assert!((actual - expected).abs() < 1e-6);
             }
+        }
+    }
+
+    #[test]
+    fn reciprocal_diagonals_remain_finite_across_covariance_scales() {
+        for variance in [1e-280_f64, 1e-12, 0.25, 1e12, 1e280] {
+            let mut covariance = vec![0.; 9];
+            for i in 0..3 {
+                covariance[i * 3 + i] = variance;
+            }
+            let gaussian = Gaussian::new(1, &[0.; 3], &covariance, 0.7).unwrap();
+            assert!(gaussian
+                .inverse_diagonal
+                .iter()
+                .all(|x| x.is_finite() && *x > 0.));
+            let scale = variance.sqrt();
+            let point = [scale, 2. * scale, 3. * scale];
+            let actual = gaussian.score(&point, &mut [0.; 3]);
+            let reference = gaussian.score_dynamic(&point, &mut [0.; 3]);
+            assert!((actual - reference).abs() <= 16. * f64::EPSILON * (1. + reference.abs()));
         }
     }
 
@@ -843,10 +935,9 @@ mod tests {
         state.alive[1] = true;
         state.class.fill(1);
         state.second.fill(0);
-        for row in state.scores.as_chunks_mut::<MAX_CLUSTERS>().0 {
-            row[0] = 0.1;
-            row[1] = 0.;
-        }
+        state.ensure_score_columns(2);
+        state.scores[..4].fill(0.1);
+        state.scores[4..8].fill(0.);
         assert!(state.delete());
         assert_eq!(state.class, [0; 4]);
         assert!(!state.alive[1]);
