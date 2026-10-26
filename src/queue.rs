@@ -1,5 +1,7 @@
 //! A per-user, crash-recoverable queue shared by independent Explorer invocations.
 //! Admission and coordinator handoff use OS locks, released when a process exits.
+use crate::progress::{Publisher, WorkProgress};
+use crate::queue_progress::Progress;
 use crate::{pipeline, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -23,6 +25,10 @@ pub struct Job {
     pub input: PathBuf,
     pub phase: Phase,
     pub created_ms: u64,
+    #[serde(default)]
+    pub started_ms: Option<u64>,
+    #[serde(default)]
+    pub progress: Option<WorkProgress>,
     pub finished_ms: Option<u64>,
     pub settings: pipeline::Settings,
     pub output: Option<pipeline::Output>,
@@ -33,7 +39,12 @@ pub struct Queue {
     pub root: PathBuf,
 }
 
-fn now() -> u64 {
+pub struct ConsoleResult {
+    pub failed: bool,
+    pub needs_pause: bool,
+}
+
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -80,7 +91,9 @@ impl Queue {
 
     pub fn open(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)?;
-        for name in ["pending", "running", "done", "failed", "logs", "work"] {
+        for name in [
+            "pending", "running", "done", "failed", "logs", "work", "progress",
+        ] {
             fs::create_dir_all(root.join(name))?;
         }
         Ok(Self {
@@ -113,7 +126,26 @@ impl Queue {
         Ok(files)
     }
     fn read(path: &Path) -> Result<Job> {
-        serde_json::from_reader(File::open(path)?).map_err(json_error)
+        let mut job: Job = serde_json::from_reader(File::open(path)?).map_err(json_error)?;
+        // Progress is advisory and written atomically by this job's worker.
+        job.progress = None;
+        if let Some(started) = job.started_ms {
+            let progress = path
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("progress")
+                .join(format!("{}.json", job.id));
+            if let Ok(file) = File::open(progress) {
+                if let Ok(state) = serde_json::from_reader::<_, WorkProgress>(file) {
+                    if state.attempt_ms == started {
+                        job.progress = Some(state);
+                    }
+                }
+            }
+        }
+        Ok(job)
     }
 
     /// Submit atomically under one admission lock. Duplicate active recordings
@@ -158,6 +190,8 @@ impl Queue {
                 input,
                 phase: Phase::Pending,
                 created_ms: now(),
+                started_ms: None,
+                progress: None,
                 finished_ms: None,
                 settings: settings.clone(),
                 output: None,
@@ -174,6 +208,10 @@ impl Queue {
 
     pub fn records(&self) -> Result<Vec<Job>> {
         let _guard = self.admission()?;
+        self.records_unlocked()
+    }
+
+    fn records_unlocked(&self) -> Result<Vec<Job>> {
         let mut jobs = Vec::new();
         for phase in ["pending", "running", "done", "failed"] {
             for path in self.files(phase)? {
@@ -192,6 +230,86 @@ impl Queue {
     /// final empty check and unlock happen under the admission lock, closing
     /// the race between a new submission and an idle coordinator exiting.
     pub fn drain(&self, limit: usize, log: &mut dyn Write) -> Result<bool> {
+        let mut progress = Progress::new(self, &[], false)?;
+        Ok(self
+            .drain_inner(limit, log, &mut progress, true)?
+            .unwrap_or(false))
+    }
+
+    /// Keep one visible queue session across independent Explorer launches.
+    /// None means another visible console already owns this queue.
+    pub fn console(
+        &self,
+        limit: usize,
+        requested: &[String],
+        log: &mut dyn Write,
+    ) -> Result<Option<ConsoleResult>> {
+        let visible = self.lock_file("console.lock")?;
+        match visible.try_lock() {
+            Ok(()) => (),
+            Err(TryLockError::WouldBlock) => {
+                writeln!(
+                    log,
+                    "Queued. Progress is shown in the existing ltx-klusta console."
+                )?;
+                return Ok(None);
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+        writeln!(
+            log,
+            "ltx-klusta queue\nKeep this window open while processing.\nLogs: {}",
+            self.root.join("logs").display()
+        )?;
+        let mut progress = Progress::new(self, requested, true)?;
+        // Keep coordinator messages away from the alternate-screen dashboard.
+        let mut session_log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("logs/queue.log"))?;
+        let log: &mut dyn Write = if progress.interactive() {
+            &mut session_log
+        } else {
+            log
+        };
+        let mut failed = false;
+        let mut following = false;
+        let final_records = loop {
+            match self.drain_inner(limit, log, &mut progress, false)? {
+                Some(result) => failed |= result,
+                None if !following => {
+                    writeln!(log, "Following the existing queue coordinator...")?;
+                    following = true;
+                }
+                None => (),
+            }
+            progress.poll(self, log)?;
+            {
+                let _guard = self.admission()?;
+                if self.files("pending")?.is_empty() && self.files("running")?.is_empty() {
+                    // Release under admission before the caller waits for Enter.
+                    // A new launch can then start a new visible session.
+                    let snapshot = self.records_unlocked()?;
+                    visible.unlock()?;
+                    break snapshot;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        progress.finish(self, final_records, log)?;
+        Ok(Some(ConsoleResult {
+            failed: failed || progress.failed(),
+            needs_pause: !progress.interactive(),
+        }))
+    }
+
+    fn drain_inner(
+        &self,
+        limit: usize,
+        log: &mut dyn Write,
+        progress: &mut Progress,
+        report_existing: bool,
+    ) -> Result<Option<bool>> {
         if !(1..=16).contains(&limit) {
             return Err(Error::Invalid("jobs must be between 1 and 16"));
         }
@@ -201,8 +319,10 @@ impl Queue {
             match coordinator.try_lock() {
                 Ok(()) => (),
                 Err(TryLockError::WouldBlock) => {
-                    writeln!(log, "An existing coordinator will process these jobs. Use ltxk status to check progress.")?;
-                    return Ok(false);
+                    if report_existing {
+                        writeln!(log, "An existing coordinator will process these jobs. Use ltxk status to check progress.")?;
+                    }
+                    return Ok(None);
                 }
                 Err(TryLockError::Error(error)) => return Err(error.into()),
             }
@@ -211,6 +331,8 @@ impl Queue {
                 let mut job = Self::read(&path)?;
                 job.phase = Phase::Pending;
                 job.error = None;
+                job.started_ms = None;
+                job.finished_ms = None;
                 save(&path, &job)?;
                 fs::rename(
                     &path,
@@ -227,6 +349,7 @@ impl Queue {
         let mut workers: Vec<JoinHandle<Result<bool>>> = Vec::new();
         let mut failed = false;
         loop {
+            progress.poll(self, log)?;
             let mut i = 0;
             while i < workers.len() {
                 if workers[i].is_finished() {
@@ -243,11 +366,14 @@ impl Queue {
                 let pending = self.files("pending")?;
                 if pending.is_empty() && workers.is_empty() {
                     coordinator.unlock()?;
-                    return Ok(failed);
+                    drop(_guard);
+                    progress.poll(self, log)?;
+                    return Ok(Some(failed));
                 }
                 for path in pending.into_iter().take(limit - workers.len()) {
                     let mut job = Self::read(&path)?;
                     job.phase = Phase::Running;
+                    job.started_ms = Some(now());
                     save(&path, &job)?;
                     fs::rename(
                         &path,
@@ -286,7 +412,28 @@ impl Queue {
                 })?;
                 let mut log =
                     File::create(queue.root.join("logs").join(format!("{}.log", job.id)))?;
-                pipeline::cluster_in(&job.input, &job.settings, &work, &mut log)
+                let mut publisher = Publisher::new(
+                    queue.root.join("progress").join(format!("{}.json", job.id)),
+                    job.started_ms.unwrap(),
+                );
+                let mut progress_error = None;
+                let result = pipeline::cluster_in_observed(
+                    &job.input,
+                    &job.settings,
+                    &work,
+                    &mut log,
+                    &mut |update| {
+                        // A display update must never abort a clustering run.
+                        if let Err(error) = publisher.update(update) {
+                            progress_error = Some(error);
+                        }
+                        Ok(())
+                    },
+                );
+                if let Some(error) = progress_error {
+                    let _ = writeln!(log, "WARNING: a progress display update failed: {error}");
+                }
+                result
             },
         ));
         let outcome = outcome.unwrap_or(Err(Error::Invalid(
@@ -294,7 +441,12 @@ impl Queue {
         )));
         if work.exists() {
             if let Err(error) = fs::remove_dir_all(&work) {
-                eprintln!("ltxk: scratch cleanup {}: {error}", work.display());
+                if let Ok(mut log) = OpenOptions::new()
+                    .append(true)
+                    .open(queue.root.join("logs").join(format!("{}.log", job.id)))
+                {
+                    let _ = writeln!(log, "WARNING: scratch cleanup {}: {error}", work.display());
+                }
             }
         }
         match outcome {
@@ -304,7 +456,6 @@ impl Queue {
             }
             Err(error) => {
                 let message = error.to_string();
-                eprintln!("ltxk: {}: {message}", job.input.display());
                 let path = queue.root.join("logs").join(format!("{}.log", job.id));
                 if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(path) {
                     let _ = writeln!(log, "FAILED: {message}");
@@ -355,6 +506,51 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progress_write_failure_does_not_abort_clustering() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("constant.1");
+        let mut recording = b"num_spikes 20\r\ndata_start".to_vec();
+        let mut wave = vec![0; 216];
+        for sample in 0..50 {
+            wave[4 + sample] = sample as u8;
+        }
+        for _ in 0..20 {
+            recording.extend_from_slice(&wave);
+        }
+        fs::write(&input, recording).unwrap();
+        let queue = Queue::open(temporary.path().join("queue")).unwrap();
+        let settings = pipeline::Settings::default();
+        let id = queue
+            .submit(std::slice::from_ref(&input), &settings)
+            .unwrap()
+            .remove(0);
+        let pending = queue.root.join("pending").join(format!("{id}.json"));
+        let running = queue.root.join("running").join(format!("{id}.json"));
+        let mut job = Queue::read(&pending).unwrap();
+        job.phase = Phase::Running;
+        job.started_ms = Some(now());
+        save(&pending, &job).unwrap();
+        fs::rename(pending, running).unwrap();
+        // Make every progress write fail, independently of the job log/output.
+        fs::remove_dir(queue.root.join("progress")).unwrap();
+        fs::write(queue.root.join("progress"), b"unavailable").unwrap();
+        let failed = Queue::execute(queue.root.clone(), job).unwrap();
+        assert!(!failed, "{:?}", queue.records().unwrap());
+        assert_eq!(queue.records().unwrap()[0].phase, Phase::Done);
+        assert_eq!(
+            fs::read_to_string(input.with_extension("clu.1"))
+                .unwrap()
+                .lines()
+                .count(),
+            21
+        );
+        assert!(
+            fs::read_to_string(queue.root.join("logs").join(format!("{id}.log")))
+                .unwrap()
+                .contains("progress display update failed")
+        );
+    }
     #[test]
     fn submissions_deduplicate_active_paths_and_coordinator_handoff_is_nonblocking() {
         let temporary = tempfile::tempdir().unwrap();

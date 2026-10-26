@@ -59,8 +59,13 @@ jobs:
       - name: Package one executable without numerical DLLs
         run: |
           python scripts/package_rust.py --exe ${{ matrix.executable }} --output dist/ltxk-${{ matrix.platform }} --platform ${{ matrix.package_platform }}
-      - name: Test features, clustering, queue recovery, and optional runtime LAPACK
+      - name: Test features, clustering, console dashboard, queue recovery, and runtime LAPACK
         run: python tests/check_package.py --package dist/ltxk-${{ matrix.platform }}
+      - name: Check macOS preview launcher builds and verifies
+        if: runner.os == 'macOS'
+        run: |
+          python scripts/create_macos_preview.py --exe ${{ matrix.executable }} --output "$RUNNER_TEMP/ltx-klusta Preview.app"
+          codesign --verify --strict "$RUNNER_TEMP/ltx-klusta Preview.app"
       - name: Optional 9-million-spike Windows test
         if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
         run: |

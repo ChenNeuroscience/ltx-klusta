@@ -2,6 +2,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use ltx_klusta::{pipeline, queue::Queue, Backend, Error, Features, Result, MAX_BLOCK_SPIKES};
 use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -44,6 +45,9 @@ enum Command {
         /// Start a detached coordinator and return immediately
         #[arg(long)]
         background: bool,
+        /// Show a shared live dashboard (plain logs without a terminal); keep it open at completion
+        #[arg(long, conflicts_with = "background")]
+        console: bool,
         /// Override the per-user queue directory
         #[arg(long)]
         queue_dir: Option<PathBuf>,
@@ -52,6 +56,9 @@ enum Command {
     Resume {
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
         jobs: u32,
+        /// Show a live dashboard (plain logs without a terminal); keep it open at completion
+        #[arg(long)]
+        console: bool,
         #[arg(long)]
         queue_dir: Option<PathBuf>,
     },
@@ -105,12 +112,10 @@ impl Numerical {
             settings.block_spikes = block as usize;
         }
         if settings.backend == Backend::Nalgebra && settings.lapack_library.is_some() {
-            Cli::command()
-                .error(
-                    clap::error::ErrorKind::ArgumentConflict,
-                    "--lapack-library cannot be used with --backend nalgebra",
-                )
-                .exit();
+            exit_cli_error(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--lapack-library cannot be used with --backend nalgebra",
+            ));
         }
     }
 }
@@ -248,23 +253,40 @@ fn cluster_many(inputs: Vec<PathBuf>, settings: pipeline::Settings) -> Result<()
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+#[derive(Default)]
+struct Exit {
+    code: i32,
+    pause: bool,
+}
+
+fn run(cli: Cli) -> Result<Exit> {
     if let Some(shell) = cli.completions {
         clap_complete::generate(shell, &mut Cli::command(), "ltxk", &mut std::io::stdout());
-        return Ok(());
+        return Ok(Exit::default());
     }
     match cli.command {
-        Some(Command::Cluster { inputs, options }) => cluster_many(inputs, options.resolve()?),
+        Some(Command::Cluster { inputs, options }) => {
+            cluster_many(inputs, options.resolve()?).map(|_| Exit::default())
+        }
         Some(Command::Enqueue {
             inputs,
             options,
             background,
+            console,
             queue_dir,
         }) => {
             let settings = options.resolve()?;
             let queue = queue(queue_dir)?;
-            for id in queue.submit(&inputs, &settings)? {
+            let ids = queue.submit(&inputs, &settings)?;
+            for id in &ids {
                 println!("Queued {id}");
+            }
+            if console {
+                return console_result(queue.console(
+                    settings.jobs,
+                    &ids,
+                    &mut std::io::stderr(),
+                )?);
             }
             if background {
                 queue.start_background(settings.jobs)?;
@@ -273,15 +295,27 @@ fn run(cli: Cli) -> Result<()> {
                     "Some queued jobs failed; use ltxk status for details",
                 ));
             }
-            Ok(())
+            Ok(Exit::default())
         }
-        Some(Command::Resume { jobs, queue_dir }) => {
-            if queue(queue_dir)?.drain(jobs as usize, &mut std::io::stderr())? {
+        Some(Command::Resume {
+            jobs,
+            console,
+            queue_dir,
+        }) => {
+            let queue = queue(queue_dir)?;
+            if console {
+                return console_result(queue.console(
+                    jobs as usize,
+                    &[],
+                    &mut std::io::stderr(),
+                )?);
+            }
+            if queue.drain(jobs as usize, &mut std::io::stderr())? {
                 Err(Error::Invalid(
                     "Some queued jobs failed; use ltxk status for details",
                 ))
             } else {
-                Ok(())
+                Ok(Exit::default())
             }
         }
         Some(Command::Status { json, queue_dir }) => {
@@ -313,7 +347,7 @@ fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            Ok(())
+            Ok(Exit::default())
         }
         Some(Command::Features {
             input,
@@ -334,15 +368,61 @@ fn run(cli: Cli) -> Result<()> {
                 block_spikes: settings.block_spikes,
             })?;
             println!("Features written to {}", output.display());
-            Ok(())
+            Ok(Exit::default())
         }
-        None => cluster_many(cli.inputs, ClusterOptions::default().resolve()?),
+        None => {
+            cluster_many(cli.inputs, ClusterOptions::default().resolve()?).map(|_| Exit::default())
+        }
     }
 }
 
+fn console_result(result: Option<ltx_klusta::queue::ConsoleResult>) -> Result<Exit> {
+    match result {
+        None => Ok(Exit::default()),
+        Some(result) => Ok(Exit {
+            code: i32::from(result.failed),
+            pause: result.needs_pause,
+        }),
+    }
+}
+
+fn pause_console() {
+    if std::io::stdin().is_terminal() {
+        eprintln!("\nPress Enter to close this console session.");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+}
+
+fn exit_cli_error(error: clap::Error) -> ! {
+    let _ = error.print();
+    if error.use_stderr() && std::env::args_os().any(|arg| arg == "--console") {
+        pause_console();
+    }
+    std::process::exit(error.exit_code());
+}
+
 fn main() {
-    if let Err(error) = run(Cli::parse()) {
-        eprintln!("ltxk: {error}");
-        std::process::exit(1);
+    let args: Vec<_> = std::env::args_os().collect();
+    let console = args.iter().any(|arg| arg == "--console");
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => exit_cli_error(error),
+    };
+    match run(cli) {
+        Ok(exit) => {
+            if exit.pause {
+                pause_console();
+            }
+            if exit.code != 0 {
+                std::process::exit(exit.code);
+            }
+        }
+        Err(error) => {
+            eprintln!("ltxk: {error}");
+            if console {
+                pause_console();
+            }
+            std::process::exit(1);
+        }
     }
 }

@@ -1,6 +1,7 @@
 """End-to-end clustering, atomic output, subset assignment, and process-shared queue."""
 import argparse
 from collections import Counter
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import random
@@ -101,7 +102,12 @@ def check_cluster(exe, extra_args=()):
 
 
 def check_queue(exe):
-    with tempfile.TemporaryDirectory(prefix="ltxk queue ") as temporary:
+    with tempfile.TemporaryDirectory(prefix="ltxk queue ") as temporary, ExitStack() as logs:
+        def stop(process):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
         root = Path(temporary)
         queue = root / "queue"
         paths = []
@@ -118,13 +124,19 @@ def check_queue(exe):
         bad.write_bytes(b"malformed")
         flags = ["--jobs", "2", "--target-spikes", "250", "--min-clusters", "2", "--max-clusters", "6",
                  "--queue-dir", str(queue)]
+        # Polling without draining PIPE can block a verbose worker on Windows.
+        # Capture each process in a file so output cannot stall the queue.
+        first_log = logs.enter_context(tempfile.TemporaryFile())
         first = subprocess.Popen([str(exe), "enqueue", str(paths[0]), str(bad), *flags],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+                                 stdout=first_log, stderr=first_log)
+        logs.callback(stop, first)
         processes = [first]
         # Independent Explorer invocations append to the same running queue.
         for path in paths[1:]:
+            process_log = logs.enter_context(tempfile.TemporaryFile())
             processes.append(subprocess.Popen([str(exe), "enqueue", str(path), *flags],
-                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8"))
+                                               stdout=process_log, stderr=process_log))
+            logs.callback(stop, processes[-1])
         largest = 0
         deadline = time.monotonic() + 120
         while any(process.poll() is None for process in processes):
@@ -138,7 +150,8 @@ def check_queue(exe):
             process.communicate(timeout=5)
         status = command(exe, "status", "--json", "--queue-dir", queue)
         jobs = json.loads(status.stdout)
-        require(len(jobs) == 5 and sum(job["phase"] == "failed" for job in jobs) == 1, "Failures or jobs lost")
+        require(len(jobs) == 5 and sum(job["phase"] == "failed" for job in jobs) == 1,
+                "Failures or jobs lost: " + json.dumps(jobs, ensure_ascii=True))
         require(all(job["phase"] in ("done", "failed") for job in jobs), "Failure blocked later jobs")
         require(largest <= 2, f"Shared concurrency limit was exceeded: {largest}")
         for path in paths:

@@ -11,6 +11,7 @@ import tempfile
 from check_features import check as check_features, require
 from check_rust import check as check_rust
 from check_cluster import check_cluster, check_queue
+from check_console import check_console
 
 
 def imports(exe):
@@ -89,6 +90,7 @@ def check(package, library):
             check_rust(executable, ("--backend", "nalgebra"))
             check_cluster(executable, ("--backend", "nalgebra"))
             check_queue(executable)
+            check_console(executable)
             runtime_selection(executable, native_flags)
             check_features(executable, (*native_flags, "--block-spikes", "7"))
             check_rust(executable, native_flags)
