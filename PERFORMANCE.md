@@ -30,6 +30,13 @@ trajectory and final model; see the separate results below.
   checks. Other dimensions use the generic implementation. The operations and
   summation order are retained apart from the reciprocal multiplication below.
   No fast-math flags, reduced precision, or additional native libraries are used.
+- **Unroll and batch likelihood solves.** Explicitly select the 3/12 triangular
+  rows so LLVM sees constant inner loop bounds, and keep scratch roots local.
+  Scalar scoring uses a one-spike instance of the same kernel. Full E-steps
+  score four independent spikes together, enabling SIMD across spikes while
+  preserving each spike's operation order. Quick E-steps keep their scalar
+  selection/update loop. No additional threads or CPU-specific intrinsics are
+  needed, and generic feature dimensions retain their existing implementation.
 - **Reuse iteration storage.** CEM reuses its previous-assignment buffer rather
   than allocating it on every iteration. Means use bounded slices that allow
   vectorisation across independent feature columns.
@@ -214,6 +221,68 @@ cache freshness tracking, fresh solves when updates are unsafe or uneconomical,
 and real-recording measurements. The prototype does not establish a large
 end-to-end gain from rank-one likelihood corrections.
 
+## Assembly-guided likelihood work
+
+Inspecting the optimized macOS ARM64 executable showed that the former
+12-feature kernel still looped over triangular rows, with a conditional branch
+ladder for the unrolled inner products. The solve used scalar multiply/subtract
+instructions and repeatedly loaded/stored caller-owned scratch. Making the
+dimension a constant had not made every loop disappear.
+
+Explicit constant rows remove that ladder. Local scratch lets the compiler
+retain intermediate roots in registers. Full E-steps process four spikes per
+call; their independent solves provide SIMD lanes without reassociating the
+operations inside a spike. Tails and quick steps use the one-spike kernel.
+Cluster order, quick-step skips/stale scores, assignment ties and sequential
+full-record score reductions are retained.
+
+The actual ARM64 release disassembly contains packed `fmul.2d`/`fsub.2d` in
+the E-step. A standalone probe compiled from the same kernels for
+`x86_64-pc-windows-msvc` emits packed `mulpd`/`subpd`, without enabling AVX or
+FMA. That supports portability, but is not a Windows throughput measurement.
+Static assembly does not establish cache-miss rates or branch-misprediction
+rates. Those need hardware-counter measurements; no manual prefetch hints or
+branch-likelihood hints are added.
+
+Three repetitions per build, reversing build order on the middle repetition,
+on macOS ARM64 with nalgebra, seed 1, one recording at a time and default
+settings, compared with the incremental-statistics build:
+
+| Spikes | Total before (median) | Strict unrolled/batched (median) |
+| ---: | ---: | ---: |
+| 48,517 | 16.72 s | 6.33 s |
+| 91,242 | 7.46 s | 3.39 s |
+| 704,080 | 9.73 s | 4.55 s |
+
+Labels and every printed trial score were identical across these comparisons.
+Timings vary with other workloads: reference/strict ranges were
+14.80-16.92/6.30-9.38 s, 7.18-11.04/3.09-4.00 s and
+9.13-9.86/4.44-4.59 s respectively. These are observed local savings, not
+guarantees on other recordings or Windows machines. Most of the gain comes
+from loop/scratch changes; batching added a smaller gain in initial comparisons.
+
+Unit checks compare the new kernels bit-for-bit with the preceding scalar
+reciprocal solve, including correlated covariance, scalar/batch tails,
+nonadjacent/repeated points and full/quick E-step score history.
+
+### Relaxed arithmetic experiment
+
+A separate local prototype used Rust's operation-level
+[`algebraic_*` methods](https://doc.rust-lang.org/std/primitive.f32.html#algebraic-operators)
+only inside the scoring kernel. These permit reassociation and contraction;
+they are broader than just a precision setting. NaNs, infinities and signed
+zero can behave differently. The application's validity checks and infinite
+score sentinels should not be compiled with global finite-only assumptions.
+
+The prototype generated ARM64 fused multiply-add/subtract instructions.
+Its three-run total medians were 6.21, 3.18 and 4.71 s for the recordings above,
+versus 6.33, 3.39 and 4.55 s for strict arithmetic. Final labels matched on
+these three recordings, with one printed trial score changing slightly.
+The extra whole-program benefit was small and inconsistent, including slower
+full-record assignment on the largest recording. Relaxed arithmetic is not
+enabled in the implementation. Quick-step gathering/batching also remains
+experimental after mixed timings.
+
 ## Measure a recording
 
 Developer timing output can be enabled without changing the algorithm:
@@ -248,15 +317,13 @@ I/O and can vary with caching and other workloads.
 
 ## Further candidates
 
-- Batched likelihood/triangular solves could improve SIMD or BLAS throughput.
-  They need tests of numerical error and complete clustering results because
-  backend reduction order can differ.
+- Full-record assignment could use multi-spike scoring too. Preserve the
+  sequential score reduction and labels' original order while buffering rows.
 - Full-record assignment is independent per spike and could run in parallel.
   Preserve output order and the sequential full-score reduction so that trial
   selection remains reproducible. Coordinate its worker budget with the
   existing recording-level queue to avoid oversubscribing the machine.
-- SIMD across independent spikes could shorten Gaussian evaluation while
-  preserving each spike's reduction order. Register pressure, scattered feature
-  loads and quick-step masks need measurement on both ARM64 and x64.
+- Wider batches and quick-step gather kernels need measurements of register
+  spills, instruction footprint and selection overhead on both ARM64 and x64.
 
 These are candidates for measurement, rather than enabled algorithm changes.
