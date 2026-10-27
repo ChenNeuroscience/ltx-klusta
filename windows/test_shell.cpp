@@ -75,7 +75,7 @@ int wmain(int argc, wchar_t** argv) {
             EXPCMDSTATE state = ECS_DISABLED;
             ltxk::hcheck(command->GetState(selected.Get(), FALSE, &state), L"Cannot query command eligibility.");
             const bool eligible = paths[0] == one && (paths.size() == 1 || paths[1] == two);
-            require(state == (eligible ? ECS_ENABLED : ECS_HIDDEN), "Wrong selection eligibility");
+            require(state == static_cast<EXPCMDSTATE>(eligible ? ECS_ENABLED : ECS_HIDDEN), "Wrong selection eligibility");
         }
         EXPCMDSTATE state;
         auto large = items(std::vector<std::wstring>(65, one));

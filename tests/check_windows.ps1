@@ -14,7 +14,10 @@ foreach ($name in @('ltxk.exe', 'ltxk-launch.exe', 'ltxk-shell.dll', 'ltxk.msix'
     if (-not $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint -ne $cert.Thumbprint -or
         $signature.Status -eq 'HashMismatch') { throw "Incorrect signature on $name." }
 }
-if (Get-ChildItem -LiteralPath $PackageDirectory -Recurse -Include '*.pfx', '*.key', '*.lib', '*.exp', '*.obj') {
+# Windows PowerShell 5.1 ignores -Include with -LiteralPath. Filter the
+# enumerated files explicitly so ordinary package files are not false positives.
+if (Get-ChildItem -LiteralPath $PackageDirectory -Recurse -File |
+    Where-Object { $_.Extension -in @('.pfx', '.key', '.lib', '.exp', '.obj') }) {
     throw 'Private keys or native build intermediates were packaged.'
 }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
