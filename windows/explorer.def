@@ -1,0 +1,4 @@
+LIBRARY "ltxk-shell"
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

@@ -33,6 +33,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)] // Parsed once per process.
 enum Command {
+    /// Submit a selection from the Windows Explorer launcher without a console
+    #[command(hide = true)]
+    Enqueue {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        queue_dir: Option<PathBuf>,
+    },
     /// Cluster recordings through the shared queue, showing progress
     Cluster {
         #[arg(required = true, num_args = 1.., value_hint = clap::ValueHint::FilePath)]
@@ -311,6 +319,25 @@ fn run(cli: Cli) -> Result<Exit> {
         return Ok(Exit::default());
     }
     match cli.command {
+        Some(Command::Enqueue { request, queue_dir }) => {
+            let inputs: Vec<PathBuf> = serde_json::from_reader(std::fs::File::open(request)?)
+                .map_err(|error| Error::Message(format!("Explorer selection: {error}")))?;
+            if inputs.is_empty() {
+                return Err(Error::Invalid("Select at least one recording"));
+            }
+            for input in &inputs {
+                if !input.is_absolute() || !pipeline::is_recording_name(input) {
+                    return Err(Error::Message(format!(
+                        "Not a tetrode recording: {}",
+                        input.display()
+                    )));
+                }
+            }
+            let settings = ClusterOptions::default().resolve()?;
+            let ids = open_queue(queue_dir)?.submit(&inputs, &settings)?;
+            println!("Queued {} recordings", ids.len());
+            Ok(Exit::default())
+        }
         Some(Command::Cluster {
             inputs,
             options,

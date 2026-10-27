@@ -113,6 +113,21 @@ pub struct Output {
     pub stride: usize,
 }
 
+/// Filename-only eligibility for Explorer; opening the recording validates its contents.
+pub fn is_recording_name(input: &Path) -> bool {
+    if tetrode_number(input).is_err() {
+        return false;
+    }
+    let kind = input
+        .file_stem()
+        .and_then(|stem| Path::new(stem).extension())
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    !["clu", "fet", "res", "spk"]
+        .iter()
+        .any(|sidecar| kind.eq_ignore_ascii_case(sidecar))
+}
+
 /// The tetrode number: `name.N` → `N`.
 fn tetrode_number(input: &Path) -> Result<&str> {
     match input.extension().and_then(|e| e.to_str()) {

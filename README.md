@@ -8,18 +8,43 @@ It runs on Windows and on Apple Silicon Macs. There is nothing else to install.
 
 ## Install
 
-**Windows**
+**Windows x64 — recommended: install the right-click command**
 
 1. Download the `windows` zip from the
    [latest release](https://github.com/ChenNeuroscience/ltx-klusta/releases/latest).
-2. Right-click it, choose **Extract All…**, and pick a folder to keep it in.
-3. The first time you open `ltxk.exe`, Windows may say it protected your PC.
-   Click **More info**, then **Run anyway**.
+2. Right-click it and choose **Extract All…**. Open the extracted folder.
+3. Double-click **Install Explorer integration.cmd**. If Windows shows a
+   download warning, choose **More info → Run anyway**.
+4. Approve the administrator prompt to trust the bundled ltxk signing
+   certificate. Setup installs ltx-klusta for your Windows account and adds
+   **Run ltxk** to File Explorer's right-click menu.
 
-Optional: to add ltx-klusta to the right-click menu, press **Windows + R**,
-type `shell:sendto` and press Enter. Then drag `ltxk.exe` into the folder that
-opens while holding the **right** mouse button, and choose **Create shortcuts
-here**. Recordings now have a **Send to → ltxk** option.
+Select one or more recordings, such as `session.1` and `session.2`, right-click,
+and choose **Run ltxk**. They join the shared queue and progress opens in your
+default terminal. An existing ltxk console is reused, including after its
+previous recordings have finished. Open **ltx-klusta** from **Start** to see
+the queue again.
+
+The command appears directly in the Windows 11 menu. If it does not appear
+after setup, restart File Explorer or sign out and back in. Windows 10 version
+2004 or newer uses the classic menu. Outputs such as `session.clu.1` are
+excluded; select recordings only.
+
+Signing is self-signed and free: no Microsoft account, payment, or Microsoft
+review is needed. Certificate trust applies to this computer; an administrator
+may need to help on a managed lab PC. To update, download the latest Windows
+zip and run its installer again. A release with a new signing certificate asks
+for trust again. Setup carries your settings forward; close the old console
+before updating.
+
+To remove the menu command and Start shortcut, run **Uninstall Explorer
+integration.cmd**. Your recordings, results, queue, and settings are kept.
+[Windows setup details](windows/README.md) also cover removing certificate trust.
+
+**Portable alternative:** extract the zip and drag recordings onto `ltxk.exe`.
+This needs no administrator access. For a portable **Send to → ltxk** command,
+press **Windows + R**, enter `shell:sendto`, and create a shortcut to `ltxk.exe`
+in that folder.
 
 **Mac**
 
@@ -34,9 +59,10 @@ here**. Recordings now have a **Send to → ltxk** option.
 
 ## Cluster recordings
 
-Drag one or more recordings onto `ltxk.exe` (Windows) or **ltx-klusta.app**
-(Mac). Recording files end in the tetrode number: `session.1`, `session.2`
-and so on. A window opens showing each recording's progress.
+On Windows, select one or more recordings, right-click, and choose **Run ltxk**.
+You can also drag them onto `ltxk.exe` (Windows) or **ltx-klusta.app** (Mac).
+Recording files end in the tetrode number: `session.1`, `session.2` and so on.
+A window opens showing each recording's progress.
 
 - Results are saved beside each recording: `session.1` gives `session.clu.1`.
 - You can drop more recordings at any time. They join the same queue, and
@@ -46,7 +72,10 @@ and so on. A window opens showing each recording's progress.
 - Keep the window open until everything is done, then press **Enter** to close
   it. If you close it early, unfinished recordings continue the next time you
   open ltx-klusta.
-- To see the queue again, double-click `ltxk.exe`, or open the Mac app and
+- A completed progress window keeps watching for new recordings until you
+  close it, so later selections join that same window.
+- To see the queue again, choose **ltx-klusta** from Start or double-click
+  `ltxk.exe`, or open the Mac app and
   choose **Open Queue**.
 
 In the progress window, use the arrow keys to select a recording. **L** opens
@@ -57,7 +86,10 @@ A typical recording takes from a few seconds to a few minutes.
 ## Settings
 
 The defaults suit most recordings. To change them, copy `ltxk.example.json`
-to `ltxk.json` in the same folder as `ltxk.exe`, and edit it. On a Mac,
+to `ltxk.json` in the same folder as `ltxk.exe`, and edit it. With the Windows
+installer, right-click **ltx-klusta** in Start, choose **Open file location**,
+then right-click its shortcut and choose **Open file location** again to reach
+the installed files. Setup also prints this folder when it finishes. On a Mac,
 right-click **ltx-klusta.app**, choose **Show Package Contents**, and put
 `ltxk.json` in **Contents → Resources**.
 
@@ -152,6 +184,7 @@ python3 tests/check_cli.py --exe target/release/ltxk       # CLI and dumps
 python3 tests/check_features.py --exe target/release/ltxk  # PCA and feature maths
 python3 tests/check_cluster.py --exe target/release/ltxk   # clustering and queue
 python3 tests/check_console.py --exe target/release/ltxk   # progress display
+python3 tests/check_shell.py --exe target/release/ltxk     # Explorer batch submissions
 python3 tests/check_large.py --exe target/release/ltxk     # 1M spikes, bounded memory
 ```
 
@@ -171,7 +204,11 @@ recording; it is not part of CI.
 The `Build` GitHub workflow lints, tests and packages Windows x64 and macOS
 Apple Silicon builds on every push and pull request
 (`scripts/package_rust.py`, which on macOS also builds the app with
-`scripts/create_macos_app.py`). Each push to `main` publishes a release tagged
+`scripts/create_macos_app.py`, and on Windows builds and self-signs the native
+Explorer extension with `scripts/build_windows.py`). Windows builds need the
+Visual Studio C++ tools and Windows SDK; users need neither. See
+[Windows integration development](windows/README.md) for signing-key reuse and
+the Windows 11 manual checks. Each push to `main` publishes a release tagged
 with the commit.
 
 [PERFORMANCE.md](PERFORMANCE.md) describes how the clustering is kept fast

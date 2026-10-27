@@ -16,6 +16,7 @@ from check_concurrency import check_concurrency
 from check_console import check_console
 from check_features import check as check_features
 from check_large import check as check_large
+from check_shell import check_shell
 
 
 def imports(exe):
@@ -47,10 +48,16 @@ def check(package):
     for line in (package / "SHA256SUMS.txt").read_text().splitlines():
         expected, name = line.split("  ", 1)
         require(hashlib.sha256((package / name).read_bytes()).hexdigest() == expected, f"Checksum mismatch: {name}")
-    require(not list(package.glob("*.dll")), "The package should be a single executable")
     if os.name == "nt":
+        require({p.name for p in package.glob("*.dll")} == {"ltxk-shell.dll"}, "Unexpected runtime DLLs in the Windows package")
+        for name in ("ltxk-launch.exe", "ltxk.msix", "ltxk.cer", "setup.ps1", "Install Explorer integration.cmd", "Uninstall Explorer integration.cmd"):
+            require((package / name).is_file(), f"Missing Explorer integration: {name}")
         print("Windows startup DLLs:", ", ".join(sorted(imports(executable))))
         system = Path(os.environ["SystemRoot"])
+        subprocess.run([str(system / "System32/WindowsPowerShell/v1.0/powershell.exe"),
+                        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        str(Path(__file__).resolve().parent / "check_windows.ps1"),
+                        "-PackageDirectory", str(package)], check=True)
         os.environ["PATH"] = os.pathsep.join(map(str, (system / "System32", system)))
     elif sys.platform == "darwin":
         app = package / "ltx-klusta.app"
@@ -67,6 +74,7 @@ def check(package):
             check_cluster(executable)
             check_queue(executable)
             check_console(executable)
+            check_shell(executable)
             check_benchmark(executable)
             check_concurrency(executable)
             check_large(executable, 1_000_000, None, 256)

@@ -8,6 +8,7 @@ import subprocess
 import tomllib
 
 from create_macos_app import create as create_macos_app
+from build_windows import build as build_windows
 
 
 def package(exe, output, platform):
@@ -15,8 +16,12 @@ def package(exe, output, platform):
     shutil.copy2(exe, output / ("ltxk.exe" if platform == "windows" else "ltxk"))
     for name in ("README.md", "CLUSTERING.md", "ltxk.example.json"):
         shutil.copy2(name, output / name)
+    (output / "windows").mkdir()
+    shutil.copy2("windows/README.md", output / "windows/README.md")
     if platform == "macos":
         create_macos_app(exe, output / "ltx-klusta.app")
+    elif platform == "windows":
+        build_windows(output)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     compiler = subprocess.check_output(["rustc", "-vV"], text=True)
     (output / "BUILD.txt").write_text(
@@ -36,8 +41,8 @@ def package(exe, output, platform):
     if not notices:
         raise RuntimeError("Dependency licence notices were not found in the Cargo registry")
     (output / "THIRD_PARTY_NOTICES.txt").write_text("".join(notices), encoding="utf-8")
-    checksums = [f"{hashlib.sha256(item.read_bytes()).hexdigest()}  {item.name}\n"
-                 for item in sorted(output.iterdir()) if item.is_file()]
+    checksums = [f"{hashlib.sha256(item.read_bytes()).hexdigest()}  {item.relative_to(output).as_posix()}\n"
+                 for item in sorted(output.rglob("*")) if item.is_file()]
     (output / "SHA256SUMS.txt").write_text("".join(checksums), encoding="utf-8")
     archive = output.with_suffix(".zip")
     if platform == "macos":
