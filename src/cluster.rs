@@ -224,18 +224,14 @@ impl<D: Dims> Gaussian<D> {
 
     fn score_all(&self, data: &Data, output: &mut [f64]) {
         let d = self.dims.n();
-        let batched = output.len() / LANES * LANES;
-        let (output, rest_output) = output.split_at_mut(batched);
-        let (values, rest_values) = data.values.split_at(batched * d);
-        for (scores, block) in output
-            .chunks_exact_mut(LANES)
-            .zip(values.chunks_exact(LANES * d))
-        {
+        let (output, rest_output) = output.as_chunks_mut::<LANES>();
+        let (values, rest_values) = data.values.split_at(output.len() * LANES * d);
+        for (scores, block) in output.iter_mut().zip(values.chunks_exact(LANES * d)) {
             // Re-slicing tells the compiler the block's length, which a
             // ChunksExact item does not; without it this loop is far slower.
             let block = &block[..LANES * d];
             let points = std::array::from_fn(|b| &block[b * d..(b + 1) * d]);
-            scores.copy_from_slice(&self.score_lanes::<LANES>(points));
+            *scores = self.score_lanes::<LANES>(points);
         }
         for (score, point) in rest_output.iter_mut().zip(rest_values.chunks_exact(d)) {
             *score = self.score(point);
