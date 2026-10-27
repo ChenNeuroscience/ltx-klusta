@@ -35,6 +35,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
+      - name: Check Windows build environment
+        if: runner.os == 'Windows'
+        run: python tests/check_windows_build.py
       - name: Set up stable Rust and check tools
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy

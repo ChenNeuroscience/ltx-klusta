@@ -15,6 +15,21 @@ import zlib
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def batch_environment(setup):
+    # cmd.exe does not use the CRT argv quoting that subprocess applies to a
+    # list. Pass its command line verbatim; /s removes the outer /c quotes and
+    # leaves the quotes around the batch path intact (including Program Files).
+    interpreter = os.environ.get("COMSPEC", "cmd.exe")
+    command = f'call "{setup}" -arch=x64 -host_arch=x64 >nul && set'
+    output = subprocess.check_output(f'"{interpreter}" /d /u /s /c "{command}"', encoding="utf-16-le")
+    environment = os.environ.copy()
+    for line in output.splitlines():
+        if "=" in line and not line.startswith("="):
+            name, value = line.split("=", 1)
+            environment[name.upper()] = value
+    return environment
+
+
 def msvc_environment():
     locator = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio/Installer/vswhere.exe"
     install = subprocess.check_output([str(locator), "-utf8", "-latest", "-products", "*", "-requires",
@@ -22,15 +37,7 @@ def msvc_environment():
                                        "-property", "installationPath"], encoding="utf-8-sig").strip()
     if not install:
         raise RuntimeError("Visual Studio C++ build tools are required to build Explorer integration")
-    setup = Path(install) / "Common7/Tools/VsDevCmd.bat"
-    output = subprocess.check_output(["cmd.exe", "/d", "/u", "/s", "/c",
-                                      f'call "{setup}" -arch=x64 -host_arch=x64 >nul && set'], encoding="utf-16-le")
-    environment = os.environ.copy()
-    for line in output.splitlines():
-        if "=" in line and not line.startswith("="):
-            name, value = line.split("=", 1)
-            environment[name.upper()] = value
-    return environment
+    return batch_environment(Path(install) / "Common7/Tools/VsDevCmd.bat")
 
 
 def logo(size):
@@ -62,7 +69,12 @@ def build(output):
                                       + struct.pack("<BBBBHHII", 64, 64, 0, 0, 1, 32, len(image), 22) + image)
         (work / "icon.rc").write_text(f'#pragma code_page(65001)\n1 ICON "{(work / "ltxk.ico").as_posix()}"\n', encoding="utf-8")
         def run(args):
-            subprocess.run(args, check=True, cwd=work, env=environment)
+            # On Windows CreateProcess searches the parent's PATH, not the PATH
+            # supplied in env. Resolve tools against the loaded SDK environment.
+            executable = shutil.which(args[0], path=environment["PATH"])
+            if executable is None:
+                raise RuntimeError(f"Build tool was not found in the Visual Studio environment: {args[0]}")
+            subprocess.run([executable, *args[1:]], check=True, cwd=work, env=environment)
         run(["rc.exe", "/nologo", "/fo", str(work / "icon.res"), str(work / "icon.rc")])
         compiler = ["cl.exe", "/nologo", "/std:c++17", "/W4", "/WX", "/EHsc", "/MT", "/utf-8",
                     "/DUNICODE", "/D_UNICODE", "/D_WIN32_WINNT=0x0A00", "/DWINVER=0x0A00"]
