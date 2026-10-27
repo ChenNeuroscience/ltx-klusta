@@ -75,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn configuration_accepts_auto_and_legacy_fixed_limits() {
+    fn configuration_accepts_auto_and_fixed_limits() {
         use crate::pipeline::Settings;
         for json in ["{}", r#"{"jobs":"auto"}"#] {
             let settings: Settings = serde_json::from_str(json).unwrap();

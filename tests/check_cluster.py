@@ -4,33 +4,13 @@ from collections import Counter
 from contextlib import ExitStack
 import json
 from pathlib import Path
-import random
 import struct
 import subprocess
 import sys
 import tempfile
 import time
 
-from check_features import require
-
-
-def command(exe, *args):
-    return subprocess.run([str(exe), *map(str, args)], capture_output=True, text=True,
-                          encoding="utf-8", timeout=120)
-
-
-def recording(path, spikes=1200, active_channels=1):
-    rng = random.Random(4637)
-    data = bytearray(f"num_spikes {spikes}\r\ndata_start".encode())
-    for i in range(spikes):
-        for channel in range(active_channels):
-            latent = [(-45 if i % 2 == 0 else 45) * (1 - 0.12 * channel) + rng.gauss(0, 4),
-                      rng.gauss(0, 6), rng.gauss(0, 6)]
-            wave = [max(-127, min(127, round(latent[0 if j < 15 else 1 if j < 35 else 2] + rng.gauss(0, 1))))
-                    for j in range(50)]
-            data += struct.pack("<I50b", i, *wave)
-        data += bytes((4 - active_channels) * 54)
-    path.write_bytes(data)
+from common import command, recording, require
 
 
 def check_labels(path, spikes, check_populations=True):
@@ -48,7 +28,8 @@ def check_labels(path, spikes, check_populations=True):
     return labels
 
 
-def check_cluster(exe, extra_args=()):
+def check_cluster(exe):
+    extra_args = ("--no-queue",)
     with tempfile.TemporaryDirectory(prefix="ltxk cluster ") as temporary:
         root = Path(temporary)
         source = root / "wave ! λ.1"
@@ -59,7 +40,7 @@ def check_cluster(exe, extra_args=()):
         require(result.returncode == 0, result.stderr)
         check_labels(output, 1201)
         first = output.read_bytes()
-        # Same seed and backend, independent of PCA block boundaries.
+        # Same seed, independent of PCA block boundaries.
         result = command(exe, "cluster", source, "--force", "--block-spikes", "7", *extra_args)
         require(result.returncode == 0 and output.read_bytes() == first, "Clustering changed across waveform blocks: " + result.stderr)
         output.write_bytes(b"existing output must survive\n")
@@ -82,10 +63,8 @@ def check_cluster(exe, extra_args=()):
         result = command(exe, "cluster", source, "--config", config, "--force", *extra_args)
         require(result.returncode == 0 and "Start 2:" in result.stderr, result.stderr)
         require(not list((root / "scratch").iterdir()), "Private job directory was not cleaned")
-        missing = command(exe, "cluster", source, "--config", root / "missing" / "ltxk.json")
+        missing = command(exe, "cluster", source, "--config", root / "missing" / "ltxk.json", *extra_args)
         require(missing.returncode != 0, "An explicit missing configuration must not be ignored")
-        # Direct executable invocation supports Explorer drag-and-drop.
-        require(command(exe, source).returncode == 0, "Drag-and-drop positional invocation failed")
         full = root / "four channels.2"
         recording(full, 2400, active_channels=4)
         result = command(exe, "cluster", full, *extra_args)
@@ -127,14 +106,14 @@ def check_queue(exe):
         # Polling without draining PIPE can block a verbose worker on Windows.
         # Capture each process in a file so output cannot stall the queue.
         first_log = logs.enter_context(tempfile.TemporaryFile())
-        first = subprocess.Popen([str(exe), "enqueue", str(paths[0]), str(bad), *flags],
+        first = subprocess.Popen([str(exe), "cluster", str(paths[0]), str(bad), *flags],
                                  stdout=first_log, stderr=first_log)
         logs.callback(stop, first)
         processes = [first]
-        # Independent Explorer invocations append to the same running queue.
+        # Independent invocations append to the same running queue.
         for path in paths[1:]:
             process_log = logs.enter_context(tempfile.TemporaryFile())
-            processes.append(subprocess.Popen([str(exe), "enqueue", str(path), *flags],
+            processes.append(subprocess.Popen([str(exe), "cluster", str(path), *flags],
                                                stdout=process_log, stderr=process_log))
             logs.callback(stop, processes[-1])
         largest = 0
@@ -181,9 +160,17 @@ sys.stdin.read()
                                   stderr=subprocess.PIPE, text=True, encoding="utf-8")
         try:
             require(holder.stdout.readline().strip() == "locked", "Could not acquire coordinator test lock")
-            submitted = command(exe, "enqueue", paths[0], "--force", *flags)
-            require(submitted.returncode == 0 and "existing coordinator" in submitted.stderr, submitted.stderr)
+            runner_log = queue / "runner.log"
+            runner_log.write_text("", encoding="utf-8")
+            submitted = command(exe, "cluster", paths[0], "--force", "--background", *flags)
+            require(submitted.returncode == 0, submitted.stderr)
             job_id = submitted.stdout.splitlines()[0].split()[1]
+            # The detached coordinator must give way to the lock holder before we stage a crash.
+            deadline = time.monotonic() + 30
+            while "existing coordinator" not in runner_log.read_text(encoding="utf-8"):
+                require(time.monotonic() < deadline, "Background coordinator did not defer: "
+                        + runner_log.read_text(encoding="utf-8"))
+                time.sleep(0.02)
             pending = queue / "pending" / (job_id + ".json")
             job = json.loads(pending.read_text(encoding="utf-8"))
             job["phase"] = "running"
@@ -202,13 +189,13 @@ sys.stdin.read()
         records = json.loads(command(exe, "status", "--json", "--queue-dir", queue).stdout)
         require(all(job["phase"] in ("done", "failed") for job in records), "Interrupted job was not recovered")
         require(not list((queue / "work").iterdir()), "Interrupted scratch directory was not cleaned")
-        # Explorer's detached invocation must actually launch a coordinator,
+        # A detached submission must actually launch a coordinator,
         # including when the packaged executable is outside the working dir.
         directory = root / "background ! λ"
         directory.mkdir()
         background = directory / "same name.1"
         background.write_bytes(paths[0].read_bytes())
-        result = command(exe, "enqueue", background, "--background", *flags)
+        result = command(exe, "cluster", background, "--background", *flags)
         require(result.returncode == 0, result.stderr)
         job_id = result.stdout.splitlines()[0].split()[1]
         deadline = time.monotonic() + 60

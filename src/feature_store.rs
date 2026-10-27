@@ -1,4 +1,5 @@
 //! Full-record f32 features, held in bounded RAM or streamed from a binary cache.
+use crate::dump::{Dump, Point};
 use crate::{Error, Result, MAX_SPIKES};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -166,6 +167,22 @@ impl FeatureStore {
         format!(
             "{location}, {:.2} MiB of f32 features",
             (self.points * self.columns * 4) as f64 / 1048576.
+        )
+    }
+    /// Clustering sees `(value - min) / range` for each non-constant column.
+    pub(crate) fn dump_bounds(&self, dump: &Dump) -> Result<()> {
+        let shape = [self.columns];
+        dump.array(
+            Point::Features,
+            "feature_min",
+            &shape,
+            self.minimum.iter().copied(),
+        )?;
+        dump.array(
+            Point::Features,
+            "feature_range",
+            &shape,
+            self.range.iter().copied(),
         )
     }
     fn normalize(&self, mut value: impl FnMut(usize) -> f32, row: &mut Vec<f64>) {

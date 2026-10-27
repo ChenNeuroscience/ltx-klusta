@@ -1,4 +1,4 @@
-"""Exercise console handoff, live progress, packaged launchers, and a real terminal."""
+"""Exercise console handoff, live progress, drag-and-drop launch, and a real terminal."""
 import argparse
 import json
 import os
@@ -8,8 +8,7 @@ import sys
 import tempfile
 import time
 
-from check_cluster import command, recording
-from check_features import require
+from common import command, recording, require
 
 
 def wait_for(predicate, message, timeout=30):
@@ -50,15 +49,15 @@ def check_plain(exe, root):
     bad = root / "bad.2"
     recording(source, 1201)
     bad.write_bytes(b"malformed")
-    flags = ["--console", "--queue-dir", str(queue), "--target-spikes", "250", "--min-clusters", "2", "--max-clusters", "4"]
+    flags = ["--queue-dir", str(queue), "--target-spikes", "250", "--min-clusters", "2", "--max-clusters", "4"]
     coordinator = holder(queue)
     with (root / "console.txt").open("w+", encoding="utf-8") as log:
-        viewer = subprocess.Popen([str(exe), "enqueue", str(source), *flags], stdin=subprocess.DEVNULL,
+        viewer = subprocess.Popen([str(exe), "cluster", str(source), *flags], stdin=subprocess.DEVNULL,
                                   stdout=log, stderr=log)
         try:
             wait_for(lambda: "Following the existing" in (root / "console.txt").read_text(encoding="utf-8"),
                      "Visible console did not attach to coordinator")
-            second = command(exe, "enqueue", bad, *flags)
+            second = command(exe, "cluster", bad, *flags)
             require(second.returncode == 0 and "existing ltx-klusta console" in second.stderr, second.stderr)
             coordinator.kill()
             coordinator.communicate(timeout=5)
@@ -85,13 +84,13 @@ def check_plain(exe, root):
     require(progress["spikes"] == 1201 and progress["fitting_spikes"] == 300, "Progress changed subset policy")
     # Observing the queue must preserve the clustering result.
     original = source.with_suffix(".clu.1").read_bytes()
-    direct = command(exe, "cluster", source, "--force", *flags[3:])
+    direct = command(exe, "cluster", source, "--force", "--no-queue", *flags[2:])
     require(direct.returncode == 0 and source.with_suffix(".clu.1").read_bytes() == original, direct.stderr)
     # Completed history, including old failures, must not poison the next session.
-    skipped = command(exe, "enqueue", source, *flags)
+    skipped = command(exe, "cluster", source, *flags)
     require(skipped.returncode == 0 and "Skipped" in skipped.stderr and "0 failed" in skipped.stderr, skipped.stderr)
-    conflict = command(exe, "enqueue", source, "--console", "--background")
-    require(conflict.returncode != 0, "Conflicting console/background flags accepted")
+    conflict = command(exe, "cluster", source, "--no-queue", "--background")
+    require(conflict.returncode != 0, "Conflicting --no-queue/--background flags accepted")
 
 
 def check_terminal(exe, root):
@@ -109,7 +108,7 @@ def check_terminal(exe, root):
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
     environment = os.environ.copy()
     environment["TERM"] = "xterm-256color"
-    process = subprocess.Popen([str(exe), "enqueue", str(source), "--console", "--queue-dir", str(queue),
+    process = subprocess.Popen([str(exe), "cluster", str(source), "--queue-dir", str(queue),
                                 "--min-clusters", "2", "--max-clusters", "3"],
                                stdin=slave, stdout=slave, stderr=slave, env=environment)
     os.close(slave)
@@ -136,7 +135,7 @@ def check_terminal(exe, root):
         wait_for(released, "Completed dashboard did not release its console lease")
         # The finished dashboard must remain open while a fresh launch obtains
         # its own console lease. This exercises the idle/submit handoff barrier.
-        second = command(exe, "enqueue", source, "--console", "--queue-dir", queue)
+        second = command(exe, "cluster", source, "--queue-dir", queue)
         require(second.returncode == 0 and "Queue finished:" in second.stderr, second.stderr)
         for _ in range(10):
             read()
@@ -152,20 +151,20 @@ def check_terminal(exe, root):
         os.close(master)
 
 
-def check_windows_launcher(exe, root):
-    if os.name != "nt":
-        return
-    launcher = exe.with_name("runkk.bat")
-    require(launcher.is_file() and exe.with_name("open-logs.bat").is_file(), "Windows helpers missing from package")
+def check_drag_and_drop(exe, root):
+    """Dropping files onto the executable queues them in the per-user queue."""
     source = root / "dropped & ! λ.1"
     recording(source, 200)
     environment = os.environ.copy()
-    environment["LOCALAPPDATA"] = str(root / "local app data")
-    comspec = str(Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe")
-    # Pass cmd its native command-line syntax, including the outer /s /c quotes.
-    result = subprocess.run(f'"{comspec}" /d /v:off /s /c ""{launcher}" "{source}""',
-                            stdin=subprocess.DEVNULL, capture_output=True, env=environment, timeout=60)
+    # Keep the test away from the real per-user queue.
+    for name in ("LOCALAPPDATA", "HOME", "XDG_STATE_HOME"):
+        environment[name] = str(root / "user profile")
+    (root / "user profile").mkdir()
+    result = subprocess.run([str(exe), str(source)], stdin=subprocess.DEVNULL, capture_output=True,
+                            env=environment, timeout=60)
     require(result.returncode == 0 and source.with_suffix(".clu.1").is_file(), repr(result))
+    queues = list((root / "user profile").rglob("queue"))
+    require(len(queues) == 1 and list((queues[0] / "done").glob("*.json")), "Drop did not use the default queue")
 
 
 def check_console(exe):
@@ -173,8 +172,8 @@ def check_console(exe):
         root = Path(temporary)
         check_plain(exe, root)
         check_terminal(exe, root)
-        check_windows_launcher(exe, root)
-    print("Console handoff, live progress, timing, terminal restoration, and packaged launcher checks passed")
+        check_drag_and_drop(exe, root)
+    print("Console handoff, live progress, timing, terminal restoration, and drag-and-drop checks passed")
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ def measure(executable, source, config, log, timeout):
     environment = os.environ.copy()
     environment["LTXK_PROFILE"] = "1"
     command = [str(executable), "cluster", str(source), "--config", str(config),
-               "--force", "--jobs", "1", "--backend", "nalgebra", "--features", "3PC",
+               "--force", "--no-queue", "--jobs", "1", "--features", "3PC",
                "--min-clusters", "20", "--max-clusters", "30", "--seed", "1",
                "--target-spikes", "25000", "--max-iterations", "10000", "--block-spikes", "4096"]
     started = time.perf_counter()
@@ -81,7 +81,7 @@ def benchmark(args):
         raise ValueError("Choose a report path separate from recordings, cluster outputs and executables")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {"builds": {name: {"path": str(exe), "sha256": digest(exe)} for name, exe in builds.items()},
-              "settings": {"features": "3PC", "backend": "nalgebra", "seed": 1, "jobs": 1,
+              "settings": {"features": "3PC", "seed": 1, "jobs": 1,
                            "target_spikes": 25000, "initial_clusters": [20, 30], "block_spikes": 4096},
               "recordings": list(map(str, inputs)), "runs": [], "summaries": []}
     with tempfile.TemporaryDirectory(prefix="ltxk benchmark ") as temporary:
@@ -122,7 +122,7 @@ def benchmark(args):
 
 
 if __name__ == "__main__":
-    # Redirected Python output on Windows otherwise uses the legacy code page.
+    # Redirected Python output on Windows otherwise uses the ANSI code page.
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, type=Path)

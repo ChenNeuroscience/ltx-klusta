@@ -5,11 +5,6 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      large_recording:
-        description: Run the 9-million-spike Windows feature-extraction memory test
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -23,8 +18,6 @@ jobs:
     name: ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    env:
-      LTXK_REQUIRE_LAPACK: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -42,9 +35,6 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      - name: Install CI-only Windows LAPACK provider
-        if: runner.os == 'Windows'
-        run: python scripts/fetch_test_lapack.py --output native-test --env-file "$GITHUB_ENV"
       - name: Set up stable Rust and check tools
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
@@ -56,32 +46,14 @@ jobs:
           cargo test --release --locked
       - name: Build release
         run: cargo build --release --locked
-      - name: Package one executable without numerical DLLs
-        run: |
-          python scripts/package_rust.py --exe ${{ matrix.executable }} --output dist/ltxk-${{ matrix.platform }} --platform ${{ matrix.package_platform }}
-      - name: Test features, clustering, console dashboard, queue recovery, and runtime LAPACK
+      - name: Package
+        run: python scripts/package_rust.py --exe ${{ matrix.executable }} --output dist/ltxk-${{ matrix.platform }} --platform ${{ matrix.package_platform }}
+      - name: Test the package (CLI, dumps, features, clustering, queue, console, 1M spikes)
         run: python tests/check_package.py --package dist/ltxk-${{ matrix.platform }}
-      - name: Check macOS preview launcher builds and verifies
-        if: runner.os == 'macOS'
-        run: |
-          python scripts/create_macos_preview.py --exe ${{ matrix.executable }} --output "$RUNNER_TEMP/ltx-klusta Preview.app"
-          codesign --verify --strict "$RUNNER_TEMP/ltx-klusta Preview.app"
-      - name: Optional 9-million-spike Windows test
-        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
-        run: |
-          python tests/check_large.py --exe ${{ matrix.executable }} --backend nalgebra --report large-nalgebra.json
-          python tests/check_large.py --exe ${{ matrix.executable }} --backend lapack --report large-lapack.json
-          cat large-nalgebra.json large-lapack.json >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: ltxk-${{ matrix.platform }}
-          path: dist/ltxk-${{ matrix.platform }}/
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v7
-        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.large_recording
-        with:
-          name: large-recording-windows-x64
-          path: large-*.json
+          path: dist/ltxk-${{ matrix.platform }}.zip*
           if-no-files-found: error
 
   release:
@@ -100,38 +72,20 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           pattern: ltxk-*
-          path: artifacts
-      - name: Package releases and select commit tag
+          path: release
+          merge-multiple: true
+      - name: Select commit tag
         id: package
         run: |
           echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib
-          import zipfile
-
-          output = Path('release')
-          output.mkdir()
-          packages = sorted(Path('artifacts').glob('ltxk-*'))
-          if len(packages) != 2:
-              raise RuntimeError('Expected one Windows and one macOS package')
-          for package in packages:
-              archive = output / (package.name + '.zip')
-              with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
-                  for item in sorted(package.iterdir()):
-                      if package.name.startswith('ltxk-macos-') and item.name == 'ltxk':
-                          item.chmod(0o755)
-                      bundle.write(item, item.name)
-              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-              archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')
-          PY
+          test "$(ls release/*.zip | wc -l)" -eq 2
       - name: Publish GitHub release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ steps.package.outputs.tag }}
           commit: ${{ github.sha }}
           name: ltxk ${{ steps.package.outputs.tag }}
-          body: Built and tested from commit ${{ github.sha }}. Combined LTX feature extraction, classic KlustaKwik clustering, and a persistent job queue in one executable per platform. Pure Rust by default, with optional runtime LAPACK for PCA. No numerical DLLs are bundled. See CLUSTERING.md for algorithm scope and validation.
+          body: Built and tested from commit ${{ github.sha }}. Windows - download the windows zip, extract it, and drag recordings onto ltxk.exe. macOS - download the macos zip and move ltx-klusta.app to Applications. See README.md for details.
           artifacts: release/*.zip,release/*.sha256
           artifactErrorsFailBuild: true
           allowUpdates: true
