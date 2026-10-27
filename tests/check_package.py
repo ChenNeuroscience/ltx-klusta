@@ -1,4 +1,4 @@
-"""Verify shipped dependencies and exercise a package outside the source tree."""
+"""Verify the package's contents and exercise it outside the source tree."""
 import argparse
 import hashlib
 import os
@@ -8,12 +8,14 @@ import subprocess
 import sys
 import tempfile
 
-from check_features import check as check_features, require
-from check_rust import check as check_rust
-from check_cluster import check_cluster, check_queue
-from check_console import check_console
+from common import require
 from check_benchmark import check_benchmark
+from check_cli import check_cli, check_dumps
+from check_cluster import check_cluster, check_queue
 from check_concurrency import check_concurrency
+from check_console import check_console
+from check_features import check as check_features
+from check_large import check as check_large
 
 
 def imports(exe):
@@ -40,73 +42,40 @@ def imports(exe):
     return names
 
 
-def runtime_selection(executable, native_flags):
-    from check_rust import command, write_recording
-    with tempfile.TemporaryDirectory(prefix="ltxk backend ") as temporary:
-        root = Path(temporary)
-        recording = root / "wave.1"
-        write_recording(recording, [[(i-10)*((j%5)-2) for j in range(50)] for i in range(21)])
-        args = ("features", recording, root / "out", root / "count", "3PC")
-        default = command(executable, *args)
-        require(default.returncode == 0 and "nalgebra backend" in default.stderr, default.stderr)
-        automatic = command(executable, *args, "--backend", "auto")
-        expected = "nalgebra backend" if os.name == "nt" else "lapack ("
-        require(automatic.returncode == 0 and expected in automatic.stderr, automatic.stderr)
-        explicit = command(executable, *args, *native_flags)
-        require(explicit.returncode == 0 and "lapack (" in explicit.stderr, explicit.stderr)
-        for backend in ("auto", "lapack"):
-            invalid = command(executable, *args, "--backend", backend, "--lapack-library", root / "missing-library")
-            require(invalid.returncode != 0, "An explicit missing provider must be reported")
-        provider = native_flags[-1] if "--lapack-library" in native_flags else None
-        if provider:
-            environment = os.environ.copy()
-            environment["LTXK_LAPACK_LIBRARY"] = str(provider)
-            automatic = command(executable, *args, "--backend", "auto", env=environment)
-            require(automatic.returncode == 0 and "lapack (" in automatic.stderr, automatic.stderr)
-
-
-def check(package, library):
+def check(package):
     executable = package / ("ltxk.exe" if os.name == "nt" else "ltxk")
     for line in (package / "SHA256SUMS.txt").read_text().splitlines():
         expected, name = line.split("  ", 1)
         require(hashlib.sha256((package / name).read_bytes()).hexdigest() == expected, f"Checksum mismatch: {name}")
-    require(not list(package.glob("*.dll")), "The package should contain no numerical DLLs")
+    require(not list(package.glob("*.dll")), "The package should be a single executable")
     if os.name == "nt":
-        actual = {name for name in imports(executable) if "blas" in name or "lapack" in name}
-        require(not actual, f"Numerical DLLs must not be startup dependencies: {actual}")
         print("Windows startup DLLs:", ", ".join(sorted(imports(executable))))
         system = Path(os.environ["SystemRoot"])
         os.environ["PATH"] = os.pathsep.join(map(str, (system / "System32", system)))
     elif sys.platform == "darwin":
-        dependencies = subprocess.check_output(["/usr/bin/otool", "-L", str(executable)], text=True)
-        require("Accelerate.framework" not in dependencies, "Accelerate must be loaded only at runtime")
-    os.environ.pop("LTXK_LAPACK_LIBRARY", None)
-    native_flags = ["--backend", "lapack"]
-    if library:
-        native_flags += ["--lapack-library", str(library)]
+        app = package / "ltx-klusta.app"
+        require((app / "Contents" / "Resources" / "ltxk").read_bytes() == executable.read_bytes(),
+                "The app does not contain the packaged executable")
+        subprocess.run(["/usr/bin/codesign", "--verify", "--strict", "--deep", str(app)], check=True)
     with tempfile.TemporaryDirectory(prefix="ltxk isolated package ") as temporary:
         previous = Path.cwd()
         try:
             os.chdir(temporary)
-            check_features(executable, ("--backend", "nalgebra", "--block-spikes", "7"))
-            check_rust(executable, ("--backend", "nalgebra"))
-            check_cluster(executable, ("--backend", "nalgebra"))
+            check_cli(executable)
+            check_dumps(executable)
+            check_features(executable)
+            check_cluster(executable)
             check_queue(executable)
             check_console(executable)
             check_benchmark(executable)
             check_concurrency(executable)
-            runtime_selection(executable, native_flags)
-            check_features(executable, (*native_flags, "--block-spikes", "7"))
-            check_rust(executable, native_flags)
-            check_cluster(executable, native_flags)
+            check_large(executable, 1_000_000, None, 256)
         finally:
             os.chdir(previous)
-    print("The same executable passed nalgebra, auto detection, and runtime LAPACK checks")
+    print("The packaged executable passed every check")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--package", type=Path, required=True)
-    parser.add_argument("--lapack-library", type=Path, default=os.environ.get("LTXK_TEST_LAPACK_LIBRARY"))
-    args = parser.parse_args()
-    check(args.package.resolve(), Path(args.lapack_library).resolve() if args.lapack_library else None)
+    check(parser.parse_args().package.resolve())

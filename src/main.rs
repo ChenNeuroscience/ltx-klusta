@@ -1,26 +1,28 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use ltx_klusta::concurrency::JobCount;
-use ltx_klusta::{pipeline, queue::Queue, Backend, Error, Features, Result, MAX_BLOCK_SPIKES};
+use ltx_klusta::dump::Point;
+use ltx_klusta::queue::{ConsoleResult, Queue};
+use ltx_klusta::{pipeline, Error, Features, Result, MAX_BLOCK_SPIKES};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Cluster legacy tetrode recordings with PCA and classic KlustaKwik clustering.
+/// Spike sorting for tetrode recordings: PCA features, then clustering with a
+/// Rust port of KlustaKwik. Writes NAME.clu.N beside each NAME.N recording.
 #[derive(Debug, Parser)]
 #[command(
     name = "ltx-klusta",
     bin_name = "ltxk",
     version,
-    arg_required_else_help = true,
     args_conflicts_with_subcommands = true,
-    after_help = "EXAMPLES:\n  ltxk cluster recording.1\n  ltxk cluster recording.1 recording.2 --backend auto\n  ltxk enqueue recording.1 --background\n  ltxk status\n  ltxk features recording.1 temp/recording temp/count.txt 3PC\n  ltxk --completions powershell\n\nDropping recordings onto the executable also clusters them with the default configuration."
+    after_help = "EXAMPLES:\n  ltxk recording.1 recording.2       Queue recordings and watch progress\n  ltxk                               Open the queue\n  ltxk cluster recording.1 --no-queue\n  ltxk cluster recording.1 --dump features --dump-only\n  ltxk status\n\nDropping recordings onto the executable queues them with the default settings."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Recordings to cluster using ltxk.json or defaults (drag-and-drop)
+    /// Recordings to queue (drag-and-drop). With none, open the queue.
     #[arg(value_hint = clap::ValueHint::FilePath)]
     inputs: Vec<PathBuf>,
     /// Write shell completion definitions and exit
@@ -29,97 +31,48 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // Parsed once per process.
 enum Command {
-    /// Extract features, fit clusters, and write .clu.N beside each recording
+    /// Cluster recordings through the shared queue, showing progress
     Cluster {
         #[arg(required = true, num_args = 1.., value_hint = clap::ValueHint::FilePath)]
         inputs: Vec<PathBuf>,
         #[command(flatten)]
         options: ClusterOptions,
-    },
-    /// Queue recordings across independent invocations (automatic CPU budget by default)
-    Enqueue {
-        #[arg(required = true, num_args = 1.., value_hint = clap::ValueHint::FilePath)]
-        inputs: Vec<PathBuf>,
         #[command(flatten)]
-        options: ClusterOptions,
-        /// Start a detached coordinator and return immediately
-        #[arg(long)]
-        background: bool,
-        /// Show a shared live dashboard (plain logs without a terminal); keep it open at completion
-        #[arg(long, conflicts_with = "background")]
-        console: bool,
-        /// Override the per-user queue directory
-        #[arg(long)]
-        queue_dir: Option<PathBuf>,
+        mode: Mode,
     },
-    /// Resume queued or interrupted jobs after a coordinator exits
+    /// Process waiting or interrupted jobs, showing progress
     Resume {
         /// Maximum simultaneous recordings: auto or 1–16 (default: ltxk.json or auto)
         #[arg(long, value_name = "AUTO|N")]
         jobs: Option<JobCount>,
-        /// Show a live dashboard (plain logs without a terminal); keep it open at completion
-        #[arg(long)]
-        console: bool,
         #[arg(long)]
         queue_dir: Option<PathBuf>,
+        /// Process without a progress display (used for --background)
+        #[arg(long, hide = true)]
+        headless: bool,
     },
-    /// Show pending, running, completed, and failed jobs, with log locations
+    /// List queued, running, finished and failed jobs, with log locations
     Status {
         #[arg(long)]
         json: bool,
         #[arg(long)]
         queue_dir: Option<PathBuf>,
     },
-    /// Extract a .fet.N file and spike count without clustering
-    Features {
-        /// Tetrode recording with a numeric extension
-        input: PathBuf,
-        /// Output path without .fet.N
-        output_base: PathBuf,
-        /// File in which to write the spike count
-        spike_count_file: PathBuf,
-        /// Comma-separated features: 3PC, 3PC,A,VT, or A,VT
-        #[arg(value_parser = Features::parse)]
-        features: Features,
-        #[command(flatten)]
-        numerical: Numerical,
-    },
 }
 
 #[derive(Debug, Default, Args)]
-struct Numerical {
-    /// PCA backend (default: nalgebra; a library path implies lapack)
-    #[arg(long, value_enum)]
-    backend: Option<Backend>,
-    /// Optional LP64 BLAS/LAPACK provider loaded at runtime
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    lapack_library: Option<PathBuf>,
-    /// Maximum waveform block size (default: 4096 spikes)
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=MAX_BLOCK_SPIKES as i64))]
-    block_spikes: Option<u32>,
-}
-impl Numerical {
-    fn apply(self, settings: &mut pipeline::Settings) {
-        if let Some(backend) = self.backend {
-            settings.backend = backend;
-        }
-        if let Some(library) = self.lapack_library {
-            if self.backend.is_none() {
-                settings.backend = Backend::Lapack;
-            }
-            settings.lapack_library = Some(library);
-        }
-        if let Some(block) = self.block_spikes {
-            settings.block_spikes = block as usize;
-        }
-        if settings.backend == Backend::Nalgebra && settings.lapack_library.is_some() {
-            exit_cli_error(Cli::command().error(
-                clap::error::ErrorKind::ArgumentConflict,
-                "--lapack-library cannot be used with --backend nalgebra",
-            ));
-        }
-    }
+struct Mode {
+    /// Process in this command only, without the shared queue
+    #[arg(long, conflicts_with_all = ["background", "queue_dir"])]
+    no_queue: bool,
+    /// Queue and return immediately; a background process does the work
+    #[arg(long)]
+    background: bool,
+    /// Use this queue folder instead of the per-user default
+    #[arg(long)]
+    queue_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Args)]
@@ -127,7 +80,7 @@ struct ClusterOptions {
     /// JSON settings file (default: ltxk.json beside the executable, if present)
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Features supplied to clustering (default: 3PC)
+    /// Features to cluster on, e.g. 3PC or 3PC,A,VT (default: 3PC)
     #[arg(long, value_parser = parse_features)]
     features: Option<String>,
     /// Smallest initial cluster count, including noise (default: 20)
@@ -136,13 +89,13 @@ struct ClusterOptions {
     /// Largest initial cluster count, including noise (default: 30)
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..100))]
     max_clusters: Option<u32>,
-    /// Fitting target, with the historical floor(N/target) stride (default: 25000)
+    /// Approximate number of spikes to fit; the rest are labelled by the fit (default: 25000)
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=25_000))]
     target_spikes: Option<u32>,
-    /// Windows-compatible random seed (default: 1)
+    /// Random seed (default: 1)
     #[arg(long)]
     seed: Option<u32>,
-    /// Maximum CEM iterations per fit (default: 10000)
+    /// Maximum EM iterations per fit (default: 10000)
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100_000))]
     max_iterations: Option<u32>,
     /// Maximum simultaneous recordings: auto or 1–16 (default: auto)
@@ -151,11 +104,21 @@ struct ClusterOptions {
     /// Replace existing .clu.N files (otherwise skip them)
     #[arg(long)]
     force: bool,
-    /// Scratch directory on a disk with room for temporary features
+    /// Scratch folder on a disk with room for temporary features
     #[arg(long)]
     work_dir: Option<PathBuf>,
-    #[command(flatten)]
-    numerical: Numerical,
+    /// Spikes per waveform block when reading recordings (default: 4096)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=MAX_BLOCK_SPIKES as i64))]
+    block_spikes: Option<u32>,
+    /// Write intermediate data as .npy files (comma-separated)
+    #[arg(long, value_enum, value_delimiter = ',')]
+    dump: Vec<Point>,
+    /// Folder for dumps, one subfolder per recording (default: NAME.dump.N beside each recording)
+    #[arg(long)]
+    dump_dir: Option<PathBuf>,
+    /// Stop once the requested dumps are written; do not write .clu files
+    #[arg(long)]
+    dump_only: bool,
 }
 
 fn parse_features(text: &str) -> std::result::Result<String, String> {
@@ -163,55 +126,106 @@ fn parse_features(text: &str) -> std::result::Result<String, String> {
         .map(|_| text.to_owned())
         .map_err(|error| error.to_string())
 }
+
+fn absolute(path: PathBuf) -> Result<PathBuf> {
+    Ok(if path.is_relative() {
+        std::env::current_dir()?.join(path)
+    } else {
+        path
+    })
+}
+
 impl ClusterOptions {
     fn resolve(self) -> Result<pipeline::Settings> {
         let mut settings = pipeline::Settings::load(self.config.as_deref())?;
+        let cluster = &mut settings.cluster;
         if let Some(features) = self.features {
             settings.features = features;
         }
         if let Some(value) = self.min_clusters {
-            settings.cluster.min_clusters = value as usize;
+            cluster.min_clusters = value as usize;
         }
         if let Some(value) = self.max_clusters {
-            settings.cluster.max_clusters = value as usize;
+            cluster.max_clusters = value as usize;
         }
         if let Some(value) = self.target_spikes {
-            settings.cluster.target_spikes = value as usize;
+            cluster.target_spikes = value as usize;
         }
         if let Some(value) = self.seed {
-            settings.cluster.seed = value;
+            cluster.seed = value;
         }
         if let Some(value) = self.max_iterations {
-            settings.cluster.max_iterations = value as usize;
+            cluster.max_iterations = value as usize;
         }
         if let Some(value) = self.jobs {
             settings.jobs = value.0;
         }
-        if self.force {
-            settings.force = true;
+        if let Some(value) = self.block_spikes {
+            settings.block_spikes = value as usize;
         }
+        settings.force |= self.force;
         if let Some(path) = self.work_dir {
-            settings.work_dir = Some(path);
+            settings.work_dir = Some(absolute(path)?);
         }
-        self.numerical.apply(&mut settings);
-        for path in [&mut settings.lapack_library, &mut settings.work_dir]
-            .into_iter()
-            .flatten()
-        {
-            if path.is_relative() {
-                *path = std::env::current_dir()?.join(&path);
-            }
+        if !self.dump.is_empty() {
+            settings.dump = self.dump;
         }
+        if let Some(path) = self.dump_dir {
+            settings.dump_dir = Some(absolute(path)?);
+        }
+        settings.dump_only |= self.dump_only;
         settings.validate()?;
         Ok(settings)
     }
 }
 
-fn queue(path: Option<PathBuf>) -> Result<Queue> {
+fn open_queue(path: Option<PathBuf>) -> Result<Queue> {
     Queue::open(path.map(Ok).unwrap_or_else(Queue::default_path)?)
 }
 
-fn cluster_many(inputs: Vec<PathBuf>, settings: pipeline::Settings) -> Result<()> {
+/// What to do once the command has finished.
+#[derive(Default)]
+struct Exit {
+    failed: bool,
+    pause: bool,
+}
+impl From<ConsoleResult> for Exit {
+    fn from(result: ConsoleResult) -> Self {
+        // The dashboard waits for the user itself; plain output in a visible
+        // console window would otherwise vanish as soon as processing ends.
+        let visible = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        Self {
+            failed: result.failed,
+            pause: result.needs_pause && visible,
+        }
+    }
+}
+
+/// Queue recordings, then process the queue (or follow the process already
+/// doing so), showing a dashboard in a terminal and plain logs otherwise.
+fn queue_and_watch(
+    inputs: &[PathBuf],
+    settings: &pipeline::Settings,
+    queue_dir: Option<PathBuf>,
+    background: bool,
+) -> Result<Exit> {
+    let queue = open_queue(queue_dir)?;
+    let ids = queue.submit(inputs, settings)?;
+    for id in &ids {
+        println!("Queued {id}");
+    }
+    if background {
+        queue.start_background(settings.jobs)?;
+        return Ok(Exit::default());
+    }
+    Ok(queue
+        .console(settings.jobs, &ids, &mut std::io::stderr())?
+        .map(Exit::from)
+        .unwrap_or_default())
+}
+
+/// Cluster recordings in this process, several at once, without the queue.
+fn cluster_here(inputs: Vec<PathBuf>, settings: pipeline::Settings) -> Result<Exit> {
     let mut unique = VecDeque::new();
     for input in inputs {
         let input = std::fs::canonicalize(&input).unwrap_or(input);
@@ -219,46 +233,76 @@ fn cluster_many(inputs: Vec<PathBuf>, settings: pipeline::Settings) -> Result<()
             unique.push_back(input);
         }
     }
-    let count = unique.len().min(settings.jobs);
+    let workers = unique.len().min(settings.jobs);
     let pending = Mutex::new(unique);
-    let failed = std::thread::scope(|scope| {
-        let mut workers = Vec::new();
-        for _ in 0..count {
-            workers.push(scope.spawn(|| {
-                let mut failed = false;
-                loop {
-                    let Some(input) = pending.lock().unwrap().pop_front() else {
-                        break;
-                    };
-                    if let Err(error) =
-                        pipeline::cluster_recording(&input, &settings, &mut std::io::stderr())
-                    {
+    let failed = Mutex::new(false);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while let Some(input) = pending.lock().unwrap().pop_front() {
+                    let result =
+                        pipeline::cluster_recording(&input, &settings, &mut std::io::stderr());
+                    if let Err(error) = result {
                         eprintln!("ltxk: {}: {error}", input.display());
-                        failed = true;
+                        *failed.lock().unwrap() = true;
                     }
                 }
-                failed
-            }));
+            });
         }
-        let mut failed = false;
-        for worker in workers {
-            failed |= worker.join().unwrap_or(true);
-        }
-        failed
     });
-    if failed {
-        Err(Error::Invalid(
-            "Some recordings failed; see the errors above",
-        ))
-    } else {
-        Ok(())
-    }
+    Ok(Exit {
+        failed: failed.into_inner().unwrap(),
+        pause: false,
+    })
 }
 
-#[derive(Default)]
-struct Exit {
-    code: i32,
-    pause: bool,
+fn status(queue_dir: Option<PathBuf>, json: bool) -> Result<Exit> {
+    let queue = open_queue(queue_dir)?;
+    let records = queue.records()?;
+    if json {
+        serde_json::to_writer_pretty(std::io::stdout(), &records)
+            .map_err(|error| Error::Message(error.to_string()))?;
+        println!();
+        return Ok(Exit::default());
+    }
+    println!("Queue: {}", queue.root.display());
+    for record in records {
+        println!(
+            "{:?}: {} [{}]",
+            record.phase,
+            record.input.display(),
+            record.id
+        );
+        if let Some(error) = record.error {
+            println!("  {error}");
+        }
+        let log = queue.root.join("logs").join(format!("{}.log", record.id));
+        println!("  Log: {}", log.display());
+    }
+    Ok(Exit::default())
+}
+
+fn resume(jobs: Option<JobCount>, queue_dir: Option<PathBuf>, headless: bool) -> Result<Exit> {
+    let queue = open_queue(queue_dir)?;
+    let jobs = match jobs {
+        Some(jobs) => jobs.0,
+        None => {
+            let settings = pipeline::Settings::load(None)?;
+            settings.validate()?;
+            settings.jobs
+        }
+    };
+    if headless {
+        let failed = queue.drain(jobs, &mut std::io::stderr())?;
+        return Ok(Exit {
+            failed,
+            pause: false,
+        });
+    }
+    Ok(queue
+        .console(jobs, &[], &mut std::io::stderr())?
+        .map(Exit::from)
+        .unwrap_or_default())
 }
 
 fn run(cli: Cli) -> Result<Exit> {
@@ -267,165 +311,56 @@ fn run(cli: Cli) -> Result<Exit> {
         return Ok(Exit::default());
     }
     match cli.command {
-        Some(Command::Cluster { inputs, options }) => {
-            cluster_many(inputs, options.resolve()?).map(|_| Exit::default())
-        }
-        Some(Command::Enqueue {
+        Some(Command::Cluster {
             inputs,
             options,
-            background,
-            console,
-            queue_dir,
+            mode,
         }) => {
             let settings = options.resolve()?;
-            let queue = queue(queue_dir)?;
-            let ids = queue.submit(&inputs, &settings)?;
-            for id in &ids {
-                println!("Queued {id}");
+            if mode.no_queue {
+                cluster_here(inputs, settings)
+            } else {
+                queue_and_watch(&inputs, &settings, mode.queue_dir, mode.background)
             }
-            if console {
-                return console_result(queue.console(
-                    settings.jobs,
-                    &ids,
-                    &mut std::io::stderr(),
-                )?);
-            }
-            if background {
-                queue.start_background(settings.jobs)?;
-            } else if queue.drain(settings.jobs, &mut std::io::stderr())? {
-                return Err(Error::Invalid(
-                    "Some queued jobs failed; use ltxk status for details",
-                ));
-            }
-            Ok(Exit::default())
         }
         Some(Command::Resume {
             jobs,
-            console,
             queue_dir,
-        }) => {
-            let queue = queue(queue_dir)?;
-            let jobs = match jobs {
-                Some(jobs) => jobs.0,
-                None => {
-                    let settings = pipeline::Settings::load(None)?;
-                    settings.validate()?;
-                    settings.jobs
-                }
-            };
-            if console {
-                return console_result(queue.console(jobs, &[], &mut std::io::stderr())?);
-            }
-            if queue.drain(jobs, &mut std::io::stderr())? {
-                Err(Error::Invalid(
-                    "Some queued jobs failed; use ltxk status for details",
-                ))
-            } else {
-                Ok(Exit::default())
-            }
-        }
-        Some(Command::Status { json, queue_dir }) => {
-            let queue = queue(queue_dir)?;
-            let records = queue.records()?;
-            if json {
-                serde_json::to_writer_pretty(std::io::stdout(), &records)
-                    .map_err(|error| Error::Message(error.to_string()))?;
-                println!();
-            } else {
-                println!("Queue: {}", queue.root.display());
-                for record in records {
-                    println!(
-                        "{:?}: {} [{}]",
-                        record.phase,
-                        record.input.display(),
-                        record.id
-                    );
-                    if let Some(error) = record.error {
-                        println!("  {error}");
-                    }
-                    println!(
-                        "  Log: {}",
-                        queue
-                            .root
-                            .join("logs")
-                            .join(format!("{}.log", record.id))
-                            .display()
-                    );
-                }
-            }
-            Ok(Exit::default())
-        }
-        Some(Command::Features {
-            input,
-            output_base,
-            spike_count_file,
-            features,
-            numerical,
-        }) => {
-            let mut settings = pipeline::Settings::default();
-            numerical.apply(&mut settings);
-            let output = ltx_klusta::extract(&ltx_klusta::Options {
-                input,
-                output_base,
-                info: spike_count_file,
-                features,
-                backend: settings.backend,
-                lapack_library: settings.lapack_library,
-                block_spikes: settings.block_spikes,
-            })?;
-            println!("Features written to {}", output.display());
-            Ok(Exit::default())
-        }
+            headless,
+        }) => resume(jobs, queue_dir, headless),
+        Some(Command::Status { json, queue_dir }) => status(queue_dir, json),
+        None if cli.inputs.is_empty() => resume(None, None, false),
         None => {
-            cluster_many(cli.inputs, ClusterOptions::default().resolve()?).map(|_| Exit::default())
+            let settings = ClusterOptions::default().resolve()?;
+            queue_and_watch(&cli.inputs, &settings, None, false)
         }
-    }
-}
-
-fn console_result(result: Option<ltx_klusta::queue::ConsoleResult>) -> Result<Exit> {
-    match result {
-        None => Ok(Exit::default()),
-        Some(result) => Ok(Exit {
-            code: i32::from(result.failed),
-            pause: result.needs_pause,
-        }),
     }
 }
 
 fn pause_console() {
     if std::io::stdin().is_terminal() {
-        eprintln!("\nPress Enter to close this console session.");
+        eprintln!("\nPress Enter to close this window.");
         let _ = std::io::stdin().read_line(&mut String::new());
     }
 }
 
-fn exit_cli_error(error: clap::Error) -> ! {
-    let _ = error.print();
-    if error.use_stderr() && std::env::args_os().any(|arg| arg == "--console") {
-        pause_console();
-    }
-    std::process::exit(error.exit_code());
-}
-
 fn main() {
-    let args: Vec<_> = std::env::args_os().collect();
-    let console = args.iter().any(|arg| arg == "--console");
-    let cli = match Cli::try_parse_from(args) {
-        Ok(cli) => cli,
-        Err(error) => exit_cli_error(error),
-    };
+    let cli = Cli::parse();
+    // A drag-and-drop or double-click opens a console window that closes on
+    // exit, so keep errors on screen until the user has read them.
+    let launched_from_desktop = cli.command.is_none() && cli.completions.is_none();
     match run(cli) {
         Ok(exit) => {
             if exit.pause {
                 pause_console();
             }
-            if exit.code != 0 {
-                std::process::exit(exit.code);
+            if exit.failed {
+                std::process::exit(1);
             }
         }
         Err(error) => {
             eprintln!("ltxk: {error}");
-            if console {
+            if launched_from_desktop {
                 pause_console();
             }
             std::process::exit(1);

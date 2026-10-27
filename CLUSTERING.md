@@ -1,152 +1,114 @@
-# Classic clustering in ltx-klusta
+# How ltx-klusta clusters a recording
 
-The supported workflow is the one in the original `fancykk/runkk.bat`:
+ltx-klusta performs PCA on each tetrode channel's waveforms, then clusters
+the resulting features with a custom-optimised Rust port derived directly from
+[KlustaKwik](https://github.com/klusta-team/klustakwik) (its unmasked mode).
+Credit for KlustaKwik goes to Kenneth D. Harris and its contributors.
 
-1. Extract `3PC` features from each active Axona tetrode channel.
-2. Use classic, unmasked KlustaKwik (`UseDistributional 0`). Try each initial
-   cluster count from 20 through 30 once, with random seed 1.
-3. Set the sampling stride to `max(1, floor(N / 25000))`. Fit `floor(N / stride)`
-   spikes, choosing one random spike from each complete interval of that stride.
-4. When the stride exceeds 1, evaluate the fitted model over **every** spike.
-   Select the trial with the lowest penalized score on the full recording.
-5. Write `recording.clu.N` beside `recording.N`. Existing outputs are skipped
-   unless `--force` is given. Label 1 is always reserved for uniform noise.
+## 1. Features
 
-This preserves the historical floor rule: recordings with fewer than 50,000
-spikes use the full data, and the fitting count is not always exactly 25,000.
-For nine million spikes, the stride is 360 and the fitting count is 25,000.
-The default fitting count is always below 50,000, regardless of recording length.
+For each of the four channels:
 
-PCA uses the **whole recording**, before this clustering subset is drawn. Its
-block size affects memory and throughput, not the definition of the PCA model.
-Clustering's fitting subset is a separate, deliberate approximation already
-used by the batch file. Each initial-count trial draws a fresh subset, as in
-the original program.
+1. Read every spike's 50 samples and accumulate their mean and covariance.
+   A channel whose samples never change is ignored.
+2. Find the covariance's eigenvectors (principal components), largest
+   variance first. Each is given a fixed sign: its largest-magnitude loading
+   is positive.
+3. For each spike, the `k`th PC feature is the dot product of the spike's
+   mean-subtracted waveform with the `k`th component.
 
-## Model and optimization
+`A` is a channel's peak-to-trough amplitude and `VT` the value at the sample
+with the largest variance. Columns are ordered as all channels' PCs, then all
+amplitudes, then all VTs. Features are stored as 32-bit floats, then each
+column is scaled to the range 0–1 over the whole recording. Constant columns
+are dropped.
 
-The model uses full-covariance Gaussian components and one uniform component
-over the features' normalized unit box. It uses classification EM (hard
-assignments), unbiased covariance estimates, a single noise pseudo-count,
-and the classic BIC penalty:
+The recording is read in blocks, so memory use does not grow with its length.
+The sums involved are exact, so the block size does not change the result.
+
+## 2. The model
+
+Each spike is a point in feature space: with `3PC` on four active channels, a
+point has 12 coordinates. The model is a mixture of:
+
+- **Gaussian clusters**, each with a weight, mean and full covariance (an
+  ellipsoid that can be tilted), and
+- **one noise cluster**, spread uniformly over the unit box.
+
+A spike's score for a cluster is its negative log-likelihood, so smaller
+means a better fit. For a Gaussian with covariance `C = L Lᵀ` (Cholesky
+factor `L`):
 
 ```
-parameters = (D*(D+1)/2 + D + 1) * (alive_components - 1)
-penalty = parameters * log(N) / 2
+solve L z = spike - mean
+score = |z|²/2 + Σ log L[i,i] - log(weight) + D/2 log(2π)
 ```
 
-Components with at most `D` fitting points or singular covariance are removed.
-The optimization retains quick E-steps, periodic full steps, one-at-a-time
-BIC deletion using runner-up assignments, and recursive two-way split proposals.
-Split comparisons retain the classic pass-start baseline. There is room for
-future algorithm improvements, but they should be evaluated separately.
-The cap is 100 components including noise, matching the supplied Windows binary.
-The classic `PriorPoint` setting only affected distributional mode and is absent.
+The model as a whole is scored by summing each spike's score for its own
+cluster, plus a BIC penalty for the number of parameters:
 
-### Follow one iteration
+```
+penalty = (D(D+1)/2 + D + 1) × (clusters - 1) × log(spikes) / 2
+```
 
-Each spike is a short feature vector: normally three PCs from each of four
-channels, for 12 numbers. A signal cluster is an ellipsoid in that feature
-space. Its mean is the center; its covariance describes the spread and
-correlations, allowing tilted ellipsoids.
+## 3. Fitting
 
-1. **Fit the current groups (M-step).** Calculate each group's count, mean and
-   unbiased covariance, and set its weight from its size. Small membership
-   changes update retained centered totals using only the moved spikes;
-   larger changes and periodic refreshes use a full fit.
-2. **Score spikes (E-step).** For each valid signal cluster, factor its
-   covariance as `L Lᵀ`. Solve `L z = spike - mean` and evaluate
-   `dot(z,z)/2 + sum(log(diag(L))) - log(weight) + D*log(2π)/2`.
-   A smaller score is a better match. The uniform noise class has its own score.
-   Log terms and the factorization are shared by all spikes in that update.
-3. **Assign groups (C-step).** Give each spike to the component with the lowest
-   score and remember its runner-up. Assignments are hard: one group per spike.
-4. **Consider a deletion.** Estimate the cost of moving a group's spikes to
-   their runner-up groups. Delete the best candidate when that cost is smaller
-   than the reduction in the BIC complexity penalty.
-5. **Periodically try splits.** Fit one and two signal groups to a candidate
-   cluster, then evaluate a promising split in the full fitting model. Accept
-   it using the classic penalized-score comparison and repeat the main loop.
+Fitting uses classification EM: each spike belongs to exactly one cluster.
+Starting from a random assignment, it repeats:
 
-Convergence requires unchanged assignments after a full scoring step and no
-accepted split. Quick steps reuse some old scores under the original rule;
-periodic full steps refresh them. Each initial-count trial performs this search
-on its own subset. Its fitted model then assigns the full recording when
-subsampling is in use, and the best full-record penalized score wins.
+1. **Fit (M-step).** Compute each cluster's weight, mean and unbiased
+   covariance from its spikes. A cluster with no more spikes than dimensions,
+   or with a singular covariance, is removed.
+2. **Score (E-step).** Score every spike against every cluster. To save time,
+   most iterations skip spikes that stayed put and were far from a cluster
+   last time, reusing their old score. Every 20th iteration, and whenever
+   many spikes moved or the total got worse, everything is re-scored.
+3. **Assign (C-step).** Move each spike to its best-scoring cluster, and
+   remember its second-best. Ties go to the lower cluster number.
+4. **Delete.** If moving one cluster's spikes to their second choices costs
+   less than the penalty that removing it saves, delete it.
+5. **Split.** Periodically, for each cluster, fit one and two clusters to its
+   spikes alone. If two fit better, and splitting improves the whole model's
+   penalised score, accept the split.
 
-The common 3/12-feature scoring kernels cache `1 / L[i,i]` for their triangular
-solves. Multiplication by this reciprocal can round differently from division;
-it preserves the model and solve equations but can change sensitive decisions.
-See [PERFORMANCE.md](PERFORMANCE.md) for measurements and validation.
+Fitting ends when an iteration that re-scored everything moved no spikes and
+accepted no split. There can be at most 100 clusters, including noise.
 
-Incremental means/covariances use algebraic updates to the same statistics;
-they do not approximate a moved spike or freeze a changing cluster. Centered
-totals avoid subtracting large raw second moments. Full fits refresh them at
-least every 20 M-steps, and a failed incremental Cholesky check retries the
-original full fit before considering the component singular. Different
-floating-point accumulation can still change sensitive clustering decisions.
+When few spikes change cluster, the M-step updates each affected cluster's
+totals using only the spikes that moved, rather than recomputing from all of
+its members. The totals are kept centred on the cluster mean, which avoids
+the rounding error of subtracting large sums of squares, and are rebuilt from
+scratch every 20 updates.
 
-Clustering casts computed features directly to `f32`, then uses `f64` for
-normalization and clustering arithmetic. It retains global min/max bounds,
-ascending component IDs for ties and the Windows CRT random generator. The
-former six-significant-digit `.fet` round-trip is removed from clustering;
-standalone feature export still uses that text format. More precise feature
-values can change assignments, subsequent RNG consumption and the selected
-model, even with the same initial seed. BLAS/LAPACK selection affects feature extraction; clustering's
-small covariance/Cholesky calculations use Rust on every platform.
+## 4. Trials and the final labels
 
-There are explicit corrections at invalid or degenerate inputs: constant
-feature columns are omitted instead of dividing by zero; singular components
-are excluded immediately instead of leaving stale likelihoods eligible for
-assignment; non-convergence is reported as an error. An entirely constant
-feature set produces only noise. Failures preserve an existing output file.
+The model is fitted once for each starting cluster count from
+`min_clusters` to `max_clusters` (20–30 by default, including noise). Each
+trial fits a fresh random subset:
 
-## Memory and temporary storage
+```
+stride  = max(1, floor(spikes / target_spikes))
+subset  = one random spike from each complete block of `stride` spikes
+```
 
-The fitting set and its scores are held in memory. Full-record `f32` features
-also stay in RAM when their total size is at most 64 MiB per file. Above that
-threshold, features stream directly to a little-endian binary cache. A
-12-column cache for nine million spikes is 432 MB (about 412 MiB), so it uses
-the disk path. The threshold bounds feature RAM independently of recording
-length and adds at most 64 MiB per active job to the fitting/PCA working sets.
+So recordings with fewer than 50,000 spikes (by default) are fitted in full,
+and larger ones are fitted to between 25,000 and 50,000 spikes. Each trial's
+model then labels **every** spike and is scored on the whole recording. The
+trial with the lowest penalised score is written as the `.clu` file, with
+noise as cluster 1 and the other non-empty clusters numbered from 2.
 
-Both storage paths use the same feature values and full-record normalization
-bounds. Fitting reads only selected spikes; full-record assignment streams
-all rows in order. There is no full-record spikes-by-clusters allocation.
-No temporary `.fet` or count file is created for clustering.
+Random numbers come from a fixed linear congruential generator (the MSVC
+`rand()` constants), so a given seed, version and recording always produce
+the same result on every platform.
 
-Scratch directories are unique, including when two source folders contain
-identically named recordings. Files are removed on completion/failure, and the
-queue clears interrupted work before retrying. `--work-dir` selects the scratch
-disk. Each initial-count trial still classifies every spike when subsampling;
-bounded RAM does not eliminate that computation.
+`--dump` can save the data at each stage; see the README.
 
-## Verification and scientific validation
+## Validation
 
-Automated checks cover covariance/likelihood equations, the noise component,
-BIC deletion, split search, Windows RNG values, large-count sampling arithmetic,
-and synthetic recordings with known separated populations. Integration tests
-exercise both full fitting and subset assignment, all-spike output, reproducible
-block sizes, Unicode paths, atomic replacement, and concurrent queue recovery.
-Windows and macOS run these checks with pure Rust and optional runtime LAPACK.
-Routine CI does not generate nine million spikes.
-
-Development checks against historical upstream source, with the Windows RNG
-substituted on macOS, produced identical labels on two synthetic recordings and
-three real recordings (48,517, 91,242 and 704,080 spikes), before removal of the
-six-significant-digit round-trip. No legacy source or
-C++ comparison harness is included in this repository or its CI. These checks
-do not identify the exact source of the customized June 2014 Windows binary
-or establish equivalence for every recording. Review representative
-recordings before adopting the new clustering implementation for analysis;
-label numbers and results can also vary across floating-point backends.
-
-## Algorithm provenance
-
-The reference is the classic path in
-[klusta-team/klustakwik, commit 9ca1d21](https://github.com/klusta-team/klustakwik/tree/9ca1d21fcbda61198e3a194bf9fa16bbae3d84ed)
-(June 2014), preceding the supplied executable's build date. Credit for
-KlustaKwik goes to Kenneth D. Harris and its contributors, including the
-subsequent work of Dan Goodman and Shabnam Kadir. The masked/distributional
-algorithm, mask-based initialization, start files, diagnostic data dumps,
-and other unused modes are outside this implementation's scope.
+Unit tests check the likelihood against analytic cases, the covariance and
+incremental updates against directly computed moments, the noise cluster,
+deletion, splitting and the random sequence. Integration tests cluster
+synthetic recordings with known, well-separated populations, check PCA against
+analytic cases, and check that every spike is labelled, including on one
+million spikes. Before adopting a new version for analysis, review its output
+on representative recordings.

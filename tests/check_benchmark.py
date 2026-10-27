@@ -6,8 +6,7 @@ import subprocess
 import sys
 import tempfile
 
-from check_cluster import recording
-from check_features import require
+from common import recording, require
 
 
 def check_benchmark(exe):

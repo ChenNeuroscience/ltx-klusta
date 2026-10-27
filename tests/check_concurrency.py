@@ -5,8 +5,7 @@ import re
 import shutil
 import tempfile
 
-from check_cluster import command, recording
-from check_features import require
+from common import command, recording, require
 
 
 def check_concurrency(exe):
@@ -32,11 +31,11 @@ def check_concurrency(exe):
         require(selected() == automatic, "Auto JSON configuration failed")
         source = root / "recording.1"
         recording(source, 200)
-        result = command(isolated, "enqueue", source, "--queue-dir", queue, "--jobs", "2")
+        result = command(isolated, "cluster", source, "--queue-dir", queue, "--jobs", "2")
         require(result.returncode == 0, result.stderr)
         records = json.loads(command(isolated, "status", "--json", "--queue-dir", queue).stdout)
         require(len(records) == 1 and records[0]["settings"]["jobs"] == 2, "Queue did not retain the resolved setting")
         for value in ("0", "17", "many"):
             require(command(isolated, "resume", "--jobs", value, "--queue-dir", queue).returncode != 0,
                     f"Invalid worker limit accepted: {value}")
-    print("Automatic/fixed worker limits, configuration, resume, and legacy job metadata passed")
+    print("Automatic/fixed worker limits, configuration, resume, and job metadata passed")

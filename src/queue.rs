@@ -1,4 +1,5 @@
-//! A per-user, crash-recoverable queue shared by independent Explorer invocations.
+//! A per-user, crash-recoverable queue shared by independent invocations
+//! (for example, several drag-and-drops onto the executable).
 //! Admission and coordinator handoff use OS locks, released when a process exits.
 use crate::progress::{Publisher, WorkProgress};
 use crate::queue_progress::Progress;
@@ -126,7 +127,14 @@ impl Queue {
         Ok(files)
     }
     fn read(path: &Path) -> Result<Job> {
-        let mut job: Job = serde_json::from_reader(File::open(path)?).map_err(json_error)?;
+        let mut record: serde_json::Value =
+            serde_json::from_reader(File::open(path)?).map_err(json_error)?;
+        // Records written by other versions may hold settings this one lacks.
+        let known = serde_json::to_value(pipeline::Settings::default()).map_err(json_error)?;
+        if let Some(settings) = record.get_mut("settings").and_then(|s| s.as_object_mut()) {
+            settings.retain(|key, _| known.get(key).is_some());
+        }
+        let mut job: Job = serde_json::from_value(record).map_err(json_error)?;
         // Progress is advisory and written atomically by this job's worker.
         job.progress = None;
         if let Some(started) = job.started_ms {
@@ -236,7 +244,7 @@ impl Queue {
             .unwrap_or(false))
     }
 
-    /// Keep one visible queue session across independent Explorer launches.
+    /// Keep one visible queue session across independent launches.
     /// None means another visible console already owns this queue.
     pub fn console(
         &self,
@@ -417,7 +425,7 @@ impl Queue {
                     job.started_ms.unwrap(),
                 );
                 let mut progress_error = None;
-                let result = pipeline::cluster_in_observed(
+                let result = pipeline::cluster_in(
                     &job.input,
                     &job.settings,
                     &work,
@@ -488,7 +496,13 @@ impl Queue {
             .open(self.root.join("runner.log"))?;
         let mut command = Command::new(std::env::current_exe()?);
         command
-            .args(["resume", "--jobs", &limit.to_string(), "--queue-dir"])
+            .args([
+                "resume",
+                "--headless",
+                "--jobs",
+                &limit.to_string(),
+                "--queue-dir",
+            ])
             .arg(&self.root)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
@@ -550,6 +564,21 @@ mod tests {
                 .unwrap()
                 .contains("progress display update failed")
         );
+    }
+    #[test]
+    fn records_from_other_versions_ignore_unknown_settings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let queue = Queue::open(temporary.path().join("queue")).unwrap();
+        let path = queue.root.join("done").join("1-old.json");
+        fs::write(
+            &path,
+            r#"{"id":"1-old","input":"a.1","phase":"done","created_ms":1,"finished_ms":2,
+                "settings":{"features":"3PC","backend":"nalgebra","jobs":2},
+                "output":null,"error":null}"#,
+        )
+        .unwrap();
+        let records = queue.records().unwrap();
+        assert_eq!(records[0].settings.jobs, 2);
     }
     #[test]
     fn submissions_deduplicate_active_paths_and_coordinator_handoff_is_nonblocking() {

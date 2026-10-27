@@ -1,329 +1,94 @@
-# Performance work
+# Performance notes
 
-The optimisations preserve the model, global normalization,
-Windows random generator, sampling rule, trial schedule and convergence rules.
-They do not reduce the fitting target or initial-count trials. Score storage
-changes preserve the arithmetic exactly. The common Gaussian scoring kernels
-use cached reciprocal diagonals, which can change floating-point rounding and,
-on sensitive data, later decisions. This retains the same mathematical solve.
+Almost all of the time goes into clustering, and most of that into scoring
+spikes against clusters (the E-step). Reading the recording and PCA take a
+few seconds even for millions of spikes. Each recording uses one thread, and
+the queue runs several recordings at once.
 
-Direct-f32 feature extraction also intentionally removes the preceding decimal
-rounding step. This retains more feature precision, but can change the search
-trajectory and final model; see the separate results below.
+None of the optimisations below change the model or the order of any
+spike's arithmetic, except where noted. Unit tests compare the optimised
+scoring bit for bit with a plain reference implementation.
 
-## Implemented
+## What makes it fast
 
-- **Feed features directly into f32 storage.** Remove decimal formatting,
-  temporary `.fet` writes and reparsing from clustering. Keep up to 64 MiB of
-  features per job in RAM; stream larger sets to a binary cache. Both paths use
-  identical f32 values and full-record normalization. The standalone `features`
-  command continues to export six-significant-digit text. This intentionally
-  removes the old decimal rounding from clustering and can change results.
-- **Retain buffered feature reads.** Subset selection previously used an
-  absolute seek before every selected spike. `BufReader::seek` discards its
-  buffer, even if the next row is already there. Relative seeks retain nearby
-  rows and avoid repeatedly reading overlapping megabyte blocks. Random-access,
-  repeated, backward, and buffer-boundary reads remain supported.
-- **Specialise common dimensions.** Gaussian likelihood and covariance updates
-  use fixed-size kernels for 3 and 12 features, the usual one-channel and
-  four-channel `3PC` cases. This lets the compiler unroll loops and remove bounds
-  checks. Other dimensions use the generic implementation. The operations and
-  summation order are retained apart from the reciprocal multiplication below.
-  No fast-math flags, reduced precision, or additional native libraries are used.
-- **Unroll and batch likelihood solves.** Explicitly select the 3/12 triangular
-  rows so LLVM sees constant inner loop bounds, and keep scratch roots local.
-  Scalar scoring uses a one-spike instance of the same kernel. Full E-steps
-  score four independent spikes together, enabling SIMD across spikes while
-  preserving each spike's operation order. Quick E-steps keep their scalar
-  selection/update loop. No additional threads or CPU-specific intrinsics are
-  needed, and generic feature dimensions retain their existing implementation.
-- **Reuse iteration storage.** CEM reuses its previous-assignment buffer rather
-  than allocating it on every iteration. Means use bounded slices that allow
-  vectorisation across independent feature columns.
-- **Stream cluster score columns.** The E-step visits one Gaussian at a time.
-  Its scores now occupy consecutive doubles, rather than one entry every 800
-  bytes in a table with 100 slots per spike. Columns are allocated on demand;
-  a local one/two-cluster split fit needs only two/three logical columns,
-  including noise. Previously computed columns are retained after deletion,
-  preserving the quick E-step's reuse of stale scores. Classification still
-  visits component IDs in ascending order, and all reductions retain spike order.
-- **Cache reciprocal Cholesky diagonals.** For the common 3/12-feature kernels,
-  compute `1 / L[i,i]` once per Gaussian update and multiply by it in each
-  triangular solve. The mean, Cholesky factor, weight and log normalization
-  are still recomputed whenever the cluster changes. This uses full-precision
-  division to construct the reciprocal, with no hardware reciprocal estimate.
-  Feature normalization and covariance estimation keep their existing divisions.
-- **Update cluster statistics incrementally.** Retain counts and centered sums
-  between M-steps and adjust them for spikes entering/leaving each group.
-  Keep membership history separate from the quick E-step's history. Rebuild
-  when more than one eighth of assignments change, a component is revived,
-  an incremental Cholesky check fails, or 20 M-steps have elapsed. Recursive
-  fits start with fresh statistics. This changes floating-point accumulation,
-  while retaining the same mean and unbiased covariance equations.
+**Feature counts known at compile time.** The clustering code is generic over
+the number of features (`Dims` in `src/cluster.rs`). The common counts, 3, 6,
+9 and 12 (3 PCs on one to four channels), are compile-time constants, so loops
+over features have fixed lengths: the compiler unrolls them, keeps small
+arrays in registers, and removes bounds checks. Any other count uses the same
+code with a run-time length.
 
-Numerical checks cover analytic correlated Gaussians, close agreement of the
-reciprocal kernels with the division-based generic solve, covariance agreement
-with independently computed moments, and complete clustering through both PCA backends. Local
-before/after benchmarks additionally compare every `.clu` byte and all reported
-trial scores on representative recordings. Input recordings remain local and
-are not included in the repository or CI.
+**Unrolled triangular solve.** Scoring solves `L z = x - mean` row by row.
+LLVM only fully unrolls innermost loops, so the row loop is written out with
+the small `unrolled_for!` macro, which gives each row's inner loop a constant
+length.
 
-## Where the time goes
+**Four spikes at a time.** Full E-steps score four spikes per call. Each
+spike's operations happen in the same order as when scoring one spike, and
+the four are independent, so they map onto SIMD instructions without
+reassociating floating-point arithmetic. No fast-math or CPU-specific flags
+are used.
 
-A six-second stack sample during a real 48,517-spike, 12-feature fit attributed
-about 65% of worker samples to Gaussian scoring and another 16% to its E-step
-caller. Covariance/mean updates accounted for about 7%. These are sampled
-proportions for that part of one recording, rather than universal percentages.
+**Reciprocal diagonal.** `1 / L[i,i]` is computed once per cluster update and
+multiplied in each solve, instead of dividing. This can change the last bit
+of a score compared with dividing.
 
-Each Gaussian evaluation solves `L z = x - mean`, then computes
-`dot(z,z)/2 + offset`. `offset` already contains the log determinant, cluster
-weight and normalizing constant; there is no logarithm per spike/cluster pair.
-The triangular solve has dependent multiply/subtract steps and one division
-per dimension, making cached reciprocals useful here.
+**Scores stored per cluster.** Each cluster's scores are stored contiguously,
+since the E-step works one cluster at a time, and the storage grows only as
+clusters are added.
 
-Changing the score layout reduces wasted cache-line traffic and removes the
-100-column allocation from small split fits. Sequential columns also suit
-hardware prefetching. No architecture-specific prefetch hints are enabled;
-they need evidence of a remaining memory bottleneck on each target CPU.
+**Incremental M-steps.** When few spikes change cluster, only their
+contributions are added to or removed from the cluster totals (see
+CLUSTERING.md). This changes floating-point rounding slightly, not the
+equations.
 
-## Validation of the score changes
+**Features as 32-bit floats.** Up to 64 MiB of features per recording stay in
+memory; larger feature sets go to a temporary file, which fitting reads
+selectively and labelling reads in order.
 
-Before the direct-f32 feature change, the storage-only prototype produced byte-identical labels and identical printed
-trial scores on three real recordings. With reciprocal scoring enabled, nine
-recordings across three sessions (48,517–704,080 spikes) retained byte-identical
-labels. Development-only traces also matched assignment hashes, full/quick
-steps, split/delete decisions and RNG state throughout the fits. Small score
-rounding differences were observed. This is evidence for those recordings,
-not a promise of identical clustering for every recording.
+Some of these are sensitive to small details of how the code is written; the
+comments in `score_lanes` and `score_all` note what to preserve. For example,
+iterating with `chunks_exact` without re-slicing each block to its known
+length made full E-steps about 75% slower.
 
-Validation used private copies of recordings and separate instrumented builds.
-The application and CI do not contain recordings or the validation trace code.
+## Measurements
 
-For the score-storage/reciprocal change, before direct-f32 extraction: three-run
-medians on the local macOS ARM64 machine, with nalgebra, seed 1,
-default fitting settings and one recording at a time:
+Apple M-series CPU, one recording at a time, default settings. Times are user
+CPU seconds (best of four runs) on synthetic nine-unit recordings, compared
+with the previous hand-unrolled implementation:
 
-| Spikes | Total before | Total after | Peak RSS before | Peak RSS after |
-| ---: | ---: | ---: | ---: | ---: |
-| 48,517 | 24.65 s | 17.68 s | 133 MiB | 61 MiB |
-| 91,242 | 9.84 s | 8.59 s | 98 MiB | 47 MiB |
-| 704,080 | 12.15 s | 11.31 s | 87 MiB | 32 MiB |
+| Recording | Features | Before | After |
+| --- | ---: | ---: | ---: |
+| 60,000 spikes, 4 channels | 12 | 2.09 s | 2.10 s |
+| 20,000 spikes, 4 channels | 12 | 1.04 s | 1.05 s |
+| 40,000 spikes, 1 channel | 3 | 0.97 s | 1.00 s |
+| 20,000 spikes, 4 channels, `3PC,A` | 16 | 6.11 s | 2.28 s |
 
-These include PCA, feature-cache creation, fitting, all-spike assignment and
-output. Build order alternated between repetitions. The largest recording
-spends more time in the unchanged PCA and I/O work. These measurements compare
-the preceding Rust build with this implementation; they are not Windows timings
-or comparisons against historical C++ KlustaKwik.
-Peak RSS uses per-process OS resource accounting, collected separately from
-the portable timing helper below.
+The 3- and 12-feature outputs were byte-identical to the previous build. The
+16-feature case previously used a slower generic path that divided rather
+than multiplied by the reciprocal, so its labels can differ slightly.
 
-## Direct-f32 feature measurements
+One million spikes cluster end to end in about 5.5 s with a peak of about
+130 MiB (`tests/check_large.py`).
 
-Three alternating repetitions per build on macOS ARM64, using nalgebra and
-one file at a time:
+## Measuring
 
-| Spikes | Feature preparation before | Feature preparation after | Total before | Total after |
-| ---: | ---: | ---: | ---: | ---: |
-| 48,517 | 0.186 s | 0.097 s | 17.15 s | 15.51 s |
-| 91,242 | 0.350 s | 0.175 s | 8.18 s | 8.01 s |
-| 704,080 | 2.690 s | 1.370 s | 10.59 s | 9.09 s |
-
-Feature preparation includes PCA/projection and cache finalization. Total
-timings also include changed CEM search trajectories, so those total savings
-cannot all be attributed to I/O removal. These inputs use the RAM path.
-
-Across nine real recordings, adjusted Rand agreement with the preceding text
-round-trip ranged from 0.715 to 1.0; seven were at least 0.95 and two were
-byte-identical. Two files selected one fewer signal cluster. The most sensitive
-file retained 21 groups but had agreement 0.715, so this change affects more
-than arbitrary label numbering on some data. These are comparisons between
-two outputs, not ground-truth accuracy measurements.
-
-On that sensitive file, the original and refactored standalone text feature
-exports were byte-identical, isolating the representation change after PCA.
-Synthetic population tests still pass. RAM and disk paths are checked against
-one another exactly, including subset/global bounds, backward/repeated reads,
-partial blocks and feature-column order. Nine-million-spike disk selection is
-tested by sizing metadata without generating a large recording in CI.
-
-## Incremental cluster statistics
-
-For a cluster with count `n`, center `mu` and centered scatter
-`S = sum((x-mu)(x-mu)^T)`, retain `n`, `mu` and `S`. For the entering/leaving
-spikes, calculate signed totals about the **old** center:
-
-```
-delta_n = number_entering - number_leaving
-delta_s = sum_entering(x-mu) - sum_leaving(x-mu)
-delta_Q = sum_entering((x-mu)(x-mu)^T) - sum_leaving((x-mu)(x-mu)^T)
-n_new = n + delta_n
-mu_new = mu + delta_s / n_new
-S_new = S + delta_Q - delta_s * delta_s^T / n_new
-cov_new = S_new / (n_new - 1)
-```
-
-These are algebraic identities, rather than a different covariance estimator.
-Centered updates avoid the cancellation of `sum(x*x) - sum(x)*sum(x)/n`;
-see [Pebay's centered-moment formulas](https://www.sandia.gov/research/publications/details/formulas-for-robust-one-pass-parallel-computation-of-covariances-and-arbitr-2008-09-01/).
-An assignment scan still costs `O(N)`; the quadratic feature work falls from
-`O(N*D*D)` to `O(moved*D*D + affected_clusters*D*D)`. Covariance factorizations
-and the existing E-step are retained. Noise weights and small-group deletion
-rules are unchanged. No diagonal jitter or covariance regularization is added.
-
-Full fits and periodic refreshes limit accumulated rounding error. Reusing a
-deleted ID forces a fresh fit; a failed downdate is recomputed from members
-before the existing singular-component rule is applied. Tests compare fresh
-and incremental fits through exchanges, noise moves, deletion/revival, small
-variance around a large center, and singular downdates. Close floating-point
-agreement does not promise identical decisions for all recordings.
-
-Three alternating repetitions on the same macOS ARM64 machine, nalgebra,
-seed 1 and default fitting settings, compared with the direct-f32 build:
-
-| Spikes | Total before (median) | Total after (median) |
-| ---: | ---: | ---: |
-| 48,517 | 15.26 s | 14.76 s |
-| 91,242 | 8.23 s | 7.29 s |
-| 704,080 | 9.14 s | 8.68 s |
-
-The three recordings retained byte-identical labels and trial cluster/noise
-counts. Printed trial scores differed by at most about `3e-8`. These are modest
-whole-program gains, and timings vary: the first reference run on 48,517 spikes
-took 26.50 s, versus about 15.25 s on the other two runs; it remains included in
-the median. This is not a Windows performance measurement.
-
-Six additional real recordings from the same three sessions also retained
-byte-identical labels. Each was compared once per build; their timings are
-validation observations rather than repeated performance estimates.
-
-### Extending incremental computation to likelihoods
-
-A single spike addition/removal changes covariance by a scaling and a rank-one
-update. The inverse-covariance identity can correct a cached squared
-Mahalanobis distance using a dot product, `O(D)` work instead of a fresh
-`O(D*D)` triangular solve. Several moves require several corrections and
-eventually favor a fresh solve. These are exact algebraic identities, but
-removals near singularity need care; see the original
-[LINPACK downdate routine](https://netlib.org/linpack/dchdd.f).
-
-A development-only prototype matched fresh likelihoods within about `1.3e-13`
-absolute error in well-conditioned 1/3/12-dimensional addition/removal checks.
-It is **not enabled** in the clustering loop. In separate instrumented fits of
-the three real recordings above, only about 8% of Gaussian evaluations followed
-1-3 membership changes in that component. About 6-14% followed no membership
-changes; most followed 12 or more, or an initial/proposal fit. These fractions
-describe evaluated spike/component pairs, not whole-program time.
-
-The quick E-step deliberately retains older scores for some spikes. A partial
-distance update must know which model produced each cached value, and keep
-that historical-score behavior intact. Further work therefore needs explicit
-cache freshness tracking, fresh solves when updates are unsafe or uneconomical,
-and real-recording measurements. The prototype does not establish a large
-end-to-end gain from rank-one likelihood corrections.
-
-## Assembly-guided likelihood work
-
-Inspecting the optimized macOS ARM64 executable showed that the former
-12-feature kernel still looped over triangular rows, with a conditional branch
-ladder for the unrolled inner products. The solve used scalar multiply/subtract
-instructions and repeatedly loaded/stored caller-owned scratch. Making the
-dimension a constant had not made every loop disappear.
-
-Explicit constant rows remove that ladder. Local scratch lets the compiler
-retain intermediate roots in registers. Full E-steps process four spikes per
-call; their independent solves provide SIMD lanes without reassociating the
-operations inside a spike. Tails and quick steps use the one-spike kernel.
-Cluster order, quick-step skips/stale scores, assignment ties and sequential
-full-record score reductions are retained.
-
-The actual ARM64 release disassembly contains packed `fmul.2d`/`fsub.2d` in
-the E-step. A standalone probe compiled from the same kernels for
-`x86_64-pc-windows-msvc` emits packed `mulpd`/`subpd`, without enabling AVX or
-FMA. That supports portability, but is not a Windows throughput measurement.
-Static assembly does not establish cache-miss rates or branch-misprediction
-rates. Those need hardware-counter measurements; no manual prefetch hints or
-branch-likelihood hints are added.
-
-Three repetitions per build, reversing build order on the middle repetition,
-on macOS ARM64 with nalgebra, seed 1, one recording at a time and default
-settings, compared with the incremental-statistics build:
-
-| Spikes | Total before (median) | Strict unrolled/batched (median) |
-| ---: | ---: | ---: |
-| 48,517 | 16.72 s | 6.33 s |
-| 91,242 | 7.46 s | 3.39 s |
-| 704,080 | 9.73 s | 4.55 s |
-
-Labels and every printed trial score were identical across these comparisons.
-Timings vary with other workloads: reference/strict ranges were
-14.80-16.92/6.30-9.38 s, 7.18-11.04/3.09-4.00 s and
-9.13-9.86/4.44-4.59 s respectively. These are observed local savings, not
-guarantees on other recordings or Windows machines. Most of the gain comes
-from loop/scratch changes; batching added a smaller gain in initial comparisons.
-
-Unit checks compare the new kernels bit-for-bit with the preceding scalar
-reciprocal solve, including correlated covariance, scalar/batch tails,
-nonadjacent/repeated points and full/quick E-step score history.
-
-### Relaxed arithmetic experiment
-
-A separate local prototype used Rust's operation-level
-[`algebraic_*` methods](https://doc.rust-lang.org/std/primitive.f32.html#algebraic-operators)
-only inside the scoring kernel. These permit reassociation and contraction;
-they are broader than just a precision setting. NaNs, infinities and signed
-zero can behave differently. The application's validity checks and infinite
-score sentinels should not be compiled with global finite-only assumptions.
-
-The prototype generated ARM64 fused multiply-add/subtract instructions.
-Its three-run total medians were 6.21, 3.18 and 4.71 s for the recordings above,
-versus 6.33, 3.39 and 4.55 s for strict arithmetic. Final labels matched on
-these three recordings, with one printed trial score changing slightly.
-The extra whole-program benefit was small and inconsistent, including slower
-full-record assignment on the largest recording. Relaxed arithmetic is not
-enabled in the implementation. Quick-step gathering/batching also remains
-experimental after mixed timings.
-
-## Measure a recording
-
-Developer timing output can be enabled without changing the algorithm:
+`LTXK_PROFILE=1` adds timings for feature extraction and for each trial's
+loading, fitting and labelling to the log:
 
 ```sh
-LTXK_PROFILE=1 ltxk cluster recording.1
+LTXK_PROFILE=1 ltxk cluster session.1 --no-queue --force
 ```
 
-This logs feature extraction/cache times and each trial's subset-loading,
-fitting, and assignment times. On PowerShell, set `$env:LTXK_PROFILE = '1'`
-before invoking `ltxk`. Queue jobs write the same timing information to their
-job logs. Normal runs omit it.
-
-For repeatable comparisons, use private copies of recordings, the same seed,
-backend and options, release builds, and sequential runs. Report medians and
-ranges across multiple runs. Cached filesystem data and other workloads affect
-timings, and macOS measurements do not establish Windows throughput.
-
-To compare two compatible `ltxk` builds from a source checkout:
+To compare two builds on your own recordings:
 
 ```sh
-python3 scripts/benchmark_cluster.py --baseline /path/to/old/ltxk --candidate target/release/ltxk --recordings /path/to/recording.1 /path/to/recording.2 --runs 3 --output comparison.json
+python3 scripts/benchmark_cluster.py --baseline old/ltxk --candidate target/release/ltxk \
+    --recordings session.1 session.2 --runs 3 --output comparison.json
 ```
 
-The helper makes private copies, pins the default fancykk settings and nalgebra,
-alternates build order, and runs one recording at a time. It records total and
-phase timings, trial scores, label hashes, raw label changes and adjusted Rand
-index (which allows label IDs to differ). Existing recording outputs remain
-untouched. Input copies and generated labels are removed on completion; the
-JSON report remains local unless you choose to share it. Timings include file
-I/O and can vary with caching and other workloads.
-
-## Further candidates
-
-- Full-record assignment could use multi-spike scoring too. Preserve the
-  sequential score reduction and labels' original order while buffering rows.
-- Full-record assignment is independent per spike and could run in parallel.
-  Preserve output order and the sequential full-score reduction so that trial
-  selection remains reproducible. Coordinate its worker budget with the
-  existing recording-level queue to avoid oversubscribing the machine.
-- Wider batches and quick-step gather kernels need measurements of register
-  spills, instruction footprint and selection overhead on both ARM64 and x64.
-
-These are candidates for measurement, rather than enabled algorithm changes.
+This works on private copies of the recordings, alternates the two builds,
+and reports timings, each trial's score, and how closely the two builds'
+labels agree (adjusted Rand index). Use release builds, run one recording at a
+time on an otherwise idle machine, and compare medians or minimums over
+several runs: other workloads easily change timings by 50% or more.

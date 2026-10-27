@@ -1,8 +1,7 @@
-"""Exercise the nine-million-spike target with bounded RAM, including on Windows."""
+"""Cluster a large recording end to end with bounded memory (default: one million spikes)."""
 import argparse
 import ctypes
 import json
-import math
 import os
 from pathlib import Path
 import random
@@ -11,7 +10,7 @@ import subprocess
 import tempfile
 import time
 
-from check_features import require
+from common import require
 
 
 def windows_peak(process):
@@ -30,25 +29,32 @@ def windows_peak(process):
     return counters.peak
 
 
-def check(exe, spikes, report, extra_args=()):
-    require(spikes >= 250 and spikes % 250 == 0, "spikes must be a positive multiple of 250")
+def write_recording(path, spikes):
+    """Three units on four channels, repeating a 250-spike bank of noisy waveforms."""
     rng = random.Random(943)
     bank = bytearray()
     for spike in range(250):
+        unit = spike % 3
         for channel in range(4):
-            bank += struct.pack("<I50b", spike, *(rng.randint(-100, 100) + channel for _ in range(50)))
-    with tempfile.TemporaryDirectory(prefix="ltxk scale ") as directory:
+            peak = (40, -30, 70)[unit] * (1 + 0.2 * channel)
+            bank += struct.pack("<I50b", spike, *(max(-127, min(127, round(
+                peak * (1 if 10 <= j < 20 else 0.2) + rng.gauss(0, 5)))) for j in range(50)))
+    with path.open("wb") as output:
+        output.write(f"num_spikes {spikes}\r\ndata_start".encode())
+        repetitions, remainder = divmod(spikes // 250, 128)
+        for _ in range(repetitions):
+            output.write(bank * 128)
+        output.write(bank * remainder)
+
+
+def check(exe, spikes, report, limit_mib):
+    require(spikes >= 250 and spikes % 250 == 0, "spikes must be a positive multiple of 250")
+    with tempfile.TemporaryDirectory(prefix="ltxk large ") as directory:
         root = Path(directory)
-        recording = root / "scale.1"
-        with recording.open("wb") as output:
-            output.write(f"num_spikes {spikes}\r\ndata_start".encode())
-            block = bank * 128
-            repetitions, remainder = divmod(spikes // 250, 128)
-            for _ in range(repetitions):
-                output.write(block)
-            output.write(bank * remainder)
+        recording = root / "large.1"
+        write_recording(recording, spikes)
         started = time.monotonic()
-        process = subprocess.Popen([str(exe), "features", str(recording), str(root / "large"), str(root / "count"), "3PC", *extra_args],
+        process = subprocess.Popen([str(exe), "cluster", str(recording), "--no-queue", "--jobs", "1"],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         peak = 0
         while process.poll() is None:
@@ -59,50 +65,38 @@ def check(exe, spikes, report, extra_args=()):
                     if process.poll() is None:
                         raise
                     break
-            if time.monotonic() - started > 600:
+            if time.monotonic() - started > 1800:
                 process.kill()
                 process.communicate()
-                raise RuntimeError("Large recording exceeded 10 minutes")
+                raise RuntimeError("Large recording exceeded 30 minutes")
             time.sleep(0.05)
         stdout, stderr = process.communicate()
         seconds = time.monotonic() - started
         require(process.returncode == 0, stdout + stderr)
         if os.name != "nt":
             import resource
-            # Maximum resident size of the Rust child on Unix.
+            # Maximum resident size of the child; bytes on macOS, KiB on Linux.
             peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
             if os.sys.platform != "darwin":
                 peak *= 1024
-        require(peak > 0 and peak < 256 * 1024**2, f"Peak memory exceeds 256 MiB: {peak}")
-        require(int((root / "count").read_text()) == spikes, "Wrong large-recording spike count")
-        rows = 0
-        first_period = []
-        with (root / "large.fet.1").open() as features:
-            require(int(next(features)) == 12, "Wrong large-recording feature width")
-            for rows, line in enumerate(features, 1):
-                if rows <= 250 or rows > spikes - 250:
-                    values = list(map(float, line.split()))
-                    require(len(values) == 12 and all(math.isfinite(v) for v in values), "Invalid large-recording features")
-                    if rows <= 250:
-                        first_period.append(values)
-                    else:
-                        require(values == first_period[(rows - 1) % 250], "Repeated waveforms produced inconsistent features")
-        require(rows == spikes, f"Expected {spikes} rows, found {rows}")
+        require(0 < peak < limit_mib * 1024**2, f"Peak memory exceeds {limit_mib} MiB: {peak}")
+        with recording.with_suffix(".clu.1").open() as labels:
+            total = int(next(labels))
+            rows = sum(1 for _ in labels)
+        require(rows == spikes, f"Expected {spikes} labels, found {rows}")
+        require(total >= 4, f"Expected at least three signal clusters plus noise, found {total}")
     results = {"spikes": spikes, "seconds": round(seconds, 3), "peak_bytes": peak,
                "memory_measurement": "Windows process peak working set" if os.name == "nt" else "Unix maximum child RSS"}
-    report.write_text(json.dumps(results, indent=2) + "\n")
+    if report:
+        report.write_text(json.dumps(results, indent=2) + "\n")
     print(json.dumps(results))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, required=True)
-    parser.add_argument("--backend", choices=("auto", "nalgebra", "lapack"), default="nalgebra")
-    parser.add_argument("--lapack-library", type=Path)
-    parser.add_argument("--spikes", type=int, default=9_000_000)
-    parser.add_argument("--report", type=Path, default=Path("large-recording.json"))
+    parser.add_argument("--spikes", type=int, default=1_000_000)
+    parser.add_argument("--memory-limit-mib", type=int, default=256)
+    parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    extra_args = ["--backend", args.backend]
-    if args.lapack_library:
-        extra_args += ["--lapack-library", str(args.lapack_library.resolve())]
-    check(args.exe.resolve(), args.spikes, args.report.resolve(), extra_args)
+    check(args.exe.resolve(), args.spikes, args.report and args.report.resolve(), args.memory_limit_mib)

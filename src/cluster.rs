@@ -1,6 +1,11 @@
-//! Classic (unmasked) KlustaKwik CEM: full covariance, uniform noise,
-//! BIC deletion, recursive split proposals, and the ltxk subset policy.
-//! Algorithm reference: klusta-team/klustakwik at 9ca1d21 (June 2014).
+//! Clustering, ported from KlustaKwik (unmasked mode): classification EM over
+//! a mixture of full-covariance Gaussians plus one uniform noise component,
+//! with BIC-penalised cluster deletion and recursive split proposals.
+//!
+//! Each initial cluster count is tried once on a stratified subset of spikes;
+//! the fitted model then labels every spike, and the trial with the lowest
+//! penalised score on the full recording wins.
+use crate::dump::{Dump, Point};
 use crate::feature_store::{Data, FeatureStore};
 use crate::progress::{Stage, Update};
 use crate::{Error, Result};
@@ -11,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub const MAX_CLUSTERS: usize = 100; // Includes the permanent uniform-noise component.
+pub const MAX_CLUSTERS: usize = 100; // Includes the permanent noise component.
+const MAX_DIMS: usize = 64; // Matches the feature store's column limit.
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -57,7 +63,8 @@ impl Options {
     }
 }
 
-/// Explicit Windows CRT generator, so results do not depend on the host's rand().
+/// The MSVC `rand()` linear congruential generator, implemented here so a
+/// seed gives the same results on every platform.
 struct Random(u32);
 impl Random {
     fn inclusive(&mut self, low: usize, high: usize) -> usize {
@@ -66,11 +73,57 @@ impl Random {
     }
 }
 
+/// BIC penalty for a model with `alive` components, including noise.
 fn penalty(points: usize, dims: usize, alive: usize) -> f64 {
     let parameters = (dims * (dims + 1) / 2 + dims + 1) * (alive - 1);
     parameters as f64 * (points as f64).ln() / 2.0
 }
 
+/// The number of features per spike.
+///
+/// The common sizes (3 PCs on 1–4 channels) are compile-time constants via
+/// [`Fixed`], so every per-feature loop has constant bounds: the compiler
+/// unrolls them, keeps small arrays in registers and drops bounds checks.
+/// Plain `usize` is the run-time fallback for any other size. All of the
+/// clustering code is generic over this, and [`run`] picks the type once.
+trait Dims: Copy + Send + Sync {
+    fn n(self) -> usize;
+}
+#[derive(Clone, Copy)]
+struct Fixed<const D: usize>;
+impl<const D: usize> Dims for Fixed<D> {
+    #[inline(always)]
+    fn n(self) -> usize {
+        D
+    }
+}
+impl Dims for usize {
+    #[inline(always)]
+    fn n(self) -> usize {
+        self
+    }
+}
+
+/// `for $i in 0..$n { $body }`, with the first 16 iterations written out.
+///
+/// LLVM fully unrolls only innermost loops, so in a triangular loop nest the
+/// inner loop's length stays variable. Writing out the outer iterations fixes
+/// it: when `$n` is a compile-time constant the guards fold away and each
+/// inner loop has a constant length. Iterations past 16 run as a normal loop.
+macro_rules! unrolled_for {
+    ($i:ident in 0..$n:expr => $body:block) => {
+        unrolled_for!(@ $i, $n, $body, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+        for $i in 16..$n $body
+    };
+    (@ $i:ident, $n:expr, $body:block, $($k:literal)*) => {
+        $(if $k < $n {
+            let $i = $k;
+            $body
+        })*
+    };
+}
+
+/// Row-major Cholesky factor of the upper triangle of a covariance matrix.
 fn cholesky(cov: &[f64], dims: usize) -> Option<Vec<f64>> {
     let mut lower = vec![0.0; dims * dims];
     for i in 0..dims {
@@ -92,26 +145,36 @@ fn cholesky(cov: &[f64], dims: usize) -> Option<Vec<f64>> {
     Some(lower)
 }
 
+/// Spikes scored together by full E-steps; see [`Gaussian::score_lanes`].
+const LANES: usize = 4;
+
+/// One cluster's likelihood, prepared once per model update.
+/// A spike's score is its negative log-likelihood: smaller is a better match.
 #[derive(Clone)]
-struct Gaussian {
+struct Gaussian<D> {
+    dims: D,
     id: usize,
     mean: Vec<f64>,
+    /// Cholesky factor `L` of the covariance, row-major.
     lower: Vec<f64>,
+    /// `1 / L[i,i]`, so each solve multiplies instead of dividing.
     inverse_diagonal: Vec<f64>,
+    /// `log det(L) - log(weight) + D/2 log(2π)`.
     offset: f64,
 }
-impl Gaussian {
-    fn new(id: usize, mean: &[f64], cov: &[f64], weight: f64) -> Option<Self> {
-        let dims = mean.len();
-        let lower = cholesky(cov, dims)?;
-        // Retain the historical casts to float in the log-normalizing terms.
-        let log_root_det: f64 = (0..dims)
-            .map(|i| f64::from(lower[i * dims + i].ln() as f32))
+impl<D: Dims> Gaussian<D> {
+    fn new(dims: D, id: usize, mean: &[f64], cov: &[f64], weight: f64) -> Option<Self> {
+        let d = dims.n();
+        let lower = cholesky(cov, d)?;
+        // KlustaKwik evaluates these log terms in single precision.
+        let log_root_det: f64 = (0..d)
+            .map(|i| f64::from(lower[i * d + i].ln() as f32))
             .sum();
         let offset = log_root_det - weight.ln()
-            + f64::from((2.0 * std::f64::consts::PI).ln() as f32) * dims as f64 / 2.0;
-        let inverse_diagonal = (0..dims).map(|i| 1.0 / lower[i * dims + i]).collect();
+            + f64::from((2.0 * std::f64::consts::PI).ln() as f32) * d as f64 / 2.0;
+        let inverse_diagonal = (0..d).map(|i| 1.0 / lower[i * d + i]).collect();
         Some(Self {
+            dims,
             id,
             mean: mean.to_vec(),
             lower,
@@ -120,105 +183,72 @@ impl Gaussian {
         })
     }
 
-    fn score(&self, point: &[f64], root: &mut [f64]) -> f64 {
-        match self.mean.len() {
-            3 => self.score_fixed::<3>(point, root),
-            12 => self.score_fixed::<12>(point, root),
-            _ => self.score_dynamic(point, root),
-        }
-    }
-
-    // The shared kernel owns its scratch space for common dimensions; the
-    // caller's scratch is needed only by the generic fallback.
-    fn score_fixed<const D: usize>(&self, point: &[f64], _root: &mut [f64]) -> f64 {
-        self.score_batch_fixed::<D, 1>([point.try_into().unwrap()])[0]
-    }
-
-    fn score_dynamic(&self, point: &[f64], root: &mut [f64]) -> f64 {
-        let dims = self.mean.len();
-        for i in 0..dims {
-            let mut value = point[i] - self.mean[i];
-            for (j, &previous) in root[..i].iter().enumerate() {
-                value -= self.lower[i * dims + j] * previous;
+    /// Score `L` spikes at once: `|z|²/2 + offset`, where `L z = spike - mean`.
+    ///
+    /// Each lane does exactly the arithmetic of a one-spike solve, in the same
+    /// order. Lanes are independent, so the compiler can use SIMD across
+    /// spikes without reordering any spike's own operations.
+    #[inline(always)]
+    fn score_lanes<const L: usize>(&self, points: [&[f64]; L]) -> [f64; L] {
+        let d = self.dims.n();
+        let points = points.map(|p| &p[..d]);
+        let (mean, lower, inverse) = (
+            &self.mean[..d],
+            &self.lower[..d * d],
+            &self.inverse_diagonal[..d],
+        );
+        let mut z = [[0.0; L]; MAX_DIMS];
+        // Forward substitution, one row of L at a time. Unrolling the rows
+        // gives each row's inner loop a constant length.
+        unrolled_for!(i in 0..d => {
+            let mut value: [f64; L] = std::array::from_fn(|b| points[b][i] - mean[i]);
+            for (j, &l) in lower[i * d..i * d + i].iter().enumerate() {
+                for b in 0..L {
+                    value[b] -= l * z[j][b];
+                }
             }
-            root[i] = value / self.lower[i * dims + i];
-        }
-        root.iter().map(|x| x * x).sum::<f64>() / 2.0 + self.offset
-    }
-
-    fn score_batch_fixed<const D: usize, const B: usize>(
-        &self,
-        points: [&[f64; D]; B],
-    ) -> [f64; B] {
-        let mean: &[f64; D] = self.mean.as_slice().try_into().unwrap();
-        let lower: &[[f64; D]; D] = self.lower.as_chunks::<D>().0.try_into().unwrap();
-        let inverse: &[f64; D] = self.inverse_diagonal.as_slice().try_into().unwrap();
-        // D is 3 or 12. Explicit rows make both triangular loop bounds constant:
-        // LLVM otherwise leaves a branch ladder in the common 12-feature solve.
-        // B=1 is the scalar path; B=4 gives independent lanes for full E-steps.
-        // Each spike retains the scalar multiply/subtract and norm-sum order.
-        let mut root = [[0.; B]; D];
-        macro_rules! row {
-            ($i:literal) => {{
-                let mut value: [f64; B] = std::array::from_fn(|b| points[b][$i] - mean[$i]);
-                for (j, previous) in root[..$i].iter().enumerate() {
-                    for b in 0..B {
-                        value[b] -= lower[$i][j] * previous[b];
-                    }
-                }
-                for b in 0..B {
-                    root[$i][b] = value[b] * inverse[$i];
-                }
-            }};
-        }
-        row!(0);
-        row!(1);
-        row!(2);
-        if D == 12 {
-            row!(3);
-            row!(4);
-            row!(5);
-            row!(6);
-            row!(7);
-            row!(8);
-            row!(9);
-            row!(10);
-            row!(11);
-        }
-        let mut norms = [-0_f64; B]; // Same identity as Iterator::sum::<f64>().
-        for row in &root {
-            for b in 0..B {
-                norms[b] += row[b] * row[b];
+            z[i] = value.map(|v| v * inverse[i]);
+        });
+        let mut norm = [-0.0; L]; // -0.0 is the identity Iterator::sum starts from.
+        for zi in &z[..d] {
+            for b in 0..L {
+                norm[b] += zi[b] * zi[b];
             }
         }
-        norms.map(|norm| norm / 2. + self.offset)
+        norm.map(|n| n / 2.0 + self.offset)
     }
 
-    fn score_all_fixed<const D: usize>(&self, data: &Data, output: &mut [f64]) {
-        const B: usize = 4;
-        let first = output.len() / B * B;
-        let rows = data.values.as_chunks::<D>().0;
-        let (blocks, tail) = output.as_chunks_mut::<B>();
-        for (block, points) in blocks.iter_mut().zip(rows.as_chunks::<B>().0) {
-            let points = std::array::from_fn(|b| &points[b]);
-            block.copy_from_slice(&self.score_batch_fixed::<D, B>(points));
+    fn score(&self, point: &[f64]) -> f64 {
+        self.score_lanes([point])[0]
+    }
+
+    fn score_all(&self, data: &Data, output: &mut [f64]) {
+        let d = self.dims.n();
+        let (output, rest_output) = output.as_chunks_mut::<LANES>();
+        let (values, rest_values) = data.values.split_at(output.len() * LANES * d);
+        for (scores, block) in output.iter_mut().zip(values.chunks_exact(LANES * d)) {
+            // Re-slicing tells the compiler the block's length, which a
+            // ChunksExact item does not; without it this loop is far slower.
+            let block = &block[..LANES * d];
+            let points = std::array::from_fn(|b| &block[b * d..(b + 1) * d]);
+            *scores = self.score_lanes::<LANES>(points);
         }
-        let mut root = [0.; D];
-        for (point, score) in rows[first..].iter().zip(tail) {
-            *score = self.score(point, &mut root);
+        for (score, point) in rest_output.iter_mut().zip(rest_values.chunks_exact(d)) {
+            *score = self.score(point);
         }
     }
 }
 
-struct Model {
+/// A fitted mixture, used to label spikes outside the fitting subset.
+struct Model<D> {
     noise_score: f64,
-    gaussians: Vec<Gaussian>,
+    gaussians: Vec<Gaussian<D>>,
 }
-impl Model {
-    fn best(&self, point: &[f64], root: &mut [f64]) -> (usize, f64) {
+impl<D: Dims> Model<D> {
+    fn best(&self, point: &[f64]) -> (usize, f64) {
         let mut best = (0, self.noise_score);
         for gaussian in &self.gaussians {
-            let score = gaussian.score(point, root);
+            let score = gaussian.score(point);
             if score < best.1 {
                 best = (gaussian.id, score);
             }
@@ -227,7 +257,47 @@ impl Model {
     }
 }
 
-struct State {
+/// `sum += sign * (point - mean)`, `scatter += sign * (point - mean)(point - mean)ᵀ`
+/// over the upper triangle.
+#[inline(always)]
+fn add_centered(
+    dims: impl Dims,
+    point: &[f64],
+    mean: &[f64],
+    mut sum: Option<&mut [f64]>,
+    scatter: &mut [f64],
+    sign: f64,
+) {
+    let d = dims.n();
+    let (point, mean, scatter) = (&point[..d], &mean[..d], &mut scatter[..d * d]);
+    for i in 0..d {
+        let delta = point[i] - mean[i];
+        if let Some(sum) = &mut sum {
+            sum[i] += sign * delta;
+        }
+        for j in i..d {
+            scatter[i * d + j] += sign * delta * (point[j] - mean[j]);
+        }
+    }
+}
+
+/// Cluster statistics as of the last M-step, kept so the next M-step can
+/// update only the spikes that changed cluster. Separate from `old_class`,
+/// which belongs to the quick E-step. Each CEM run owns its own cache.
+#[derive(Default)]
+struct Moments {
+    class: Vec<usize>,
+    counts: Vec<usize>,
+    /// Centered sums of products, `Σ(x-μ)(x-μ)ᵀ`, upper triangle.
+    scatter: Vec<f64>,
+    valid: Vec<bool>,
+    changes: Vec<(usize, usize, usize)>,
+    age: usize,
+}
+
+/// One CEM fit's working state. Component 0 is uniform noise.
+struct State<D> {
+    dims: D,
     data: Arc<Data>,
     class: Vec<usize>,
     old_class: Vec<usize>,
@@ -235,61 +305,19 @@ struct State {
     alive: Vec<bool>,
     weight: Vec<f64>,
     mean: Vec<f64>,
+    /// Upper triangles of each component's covariance.
     cov: Vec<f64>,
-    // Cluster-major columns: the E-step streams one cluster's scores at a time.
-    // Grow on demand and retain old columns for the historical quick E-step.
+    /// Cluster-major: the E-step streams one cluster's column at a time.
+    /// Grown on demand; old columns are kept for the quick E-step.
     scores: Vec<f64>,
 }
 
-// Memberships and centered sums at the last M-step, independent of old_class
-// (which belongs to the quick E-step). A CEM invocation owns its own cache, so
-// reinitializing a split fit never reuses the preceding fit's statistics.
-#[derive(Default)]
-struct Moments {
-    class: Vec<usize>,
-    counts: Vec<usize>,
-    scatter: Vec<f64>,
-    valid: Vec<bool>,
-    changes: Vec<(usize, usize, usize)>,
-    age: usize,
-}
-
-fn adjust_moments_fixed<const D: usize>(
-    point: &[f64],
-    mean: &[f64],
-    sum: &mut [f64],
-    scatter: &mut [f64],
-    sign: f64,
-) {
-    let point: &[f64; D] = point.try_into().unwrap();
-    let mean: &[f64; D] = mean.try_into().unwrap();
-    let sum: &mut [f64; D] = sum.try_into().unwrap();
-    let scatter: &mut [[f64; D]; D] = scatter.as_chunks_mut::<D>().0.try_into().unwrap();
-    let delta: [f64; D] = std::array::from_fn(|i| point[i] - mean[i]);
-    for i in 0..D {
-        sum[i] += sign * delta[i];
-        for j in i..D {
-            scatter[i][j] += sign * delta[i] * delta[j];
-        }
-    }
-}
-
-fn accumulate_cov_fixed<const D: usize>(point: &[f64], mean: &[f64], cov: &mut [f64]) {
-    let point: &[f64; D] = point.try_into().unwrap();
-    let mean: &[f64; D] = mean.try_into().unwrap();
-    let cov: &mut [[f64; D]; D] = cov.as_chunks_mut::<D>().0.try_into().unwrap();
-    let delta: [f64; D] = std::array::from_fn(|i| point[i] - mean[i]);
-    for i in 0..D {
-        for j in i..D {
-            cov[i][j] += delta[i] * delta[j];
-        }
-    }
-}
-
-impl State {
-    fn new(data: Arc<Data>) -> Self {
-        let (n, d) = (data.points, data.dims);
+impl<D: Dims> State<D> {
+    fn new(dims: D, data: Arc<Data>) -> Self {
+        let (n, d) = (data.points, dims.n());
+        debug_assert_eq!(d, data.dims);
         Self {
+            dims,
             data,
             class: vec![0; n],
             old_class: vec![0; n],
@@ -309,6 +337,7 @@ impl State {
         }
     }
 
+    /// Live component IDs, in ascending order, starting with noise.
     fn ids(&self) -> Vec<usize> {
         (0..MAX_CLUSTERS)
             .filter(|&c| c == 0 || self.alive[c])
@@ -325,12 +354,10 @@ impl State {
         }
     }
 
-    fn m_step(&mut self) {
-        self.m_step_full(None);
-    }
-
-    fn m_step_full(&mut self, cache: Option<&mut Moments>) {
-        let (n, d) = (self.data.points, self.data.dims);
+    /// Fit every component from its members: weight, mean, unbiased covariance.
+    /// Components with no more members than dimensions are removed.
+    fn m_step(&mut self, cache: Option<&mut Moments>) {
+        let (n, d) = (self.data.points, self.dims.n());
         let mut counts = [0_usize; MAX_CLUSTERS];
         self.mean.fill(0.);
         self.cov.fill(0.);
@@ -361,36 +388,20 @@ impl State {
                 }
             }
         }
-        let mut delta = vec![0.; d];
         for (p, &c) in self.class.iter().enumerate() {
             if c == 0 || !self.alive[c] {
                 continue;
             }
-            let point = self.data.row(p);
             let mean = &self.mean[c * d..(c + 1) * d];
             let cov = &mut self.cov[c * d * d..(c + 1) * d * d];
-            match d {
-                3 => accumulate_cov_fixed::<3>(point, mean, cov),
-                12 => accumulate_cov_fixed::<12>(point, mean, cov),
-                _ => {
-                    for ((value, &sample), &center) in delta.iter_mut().zip(point).zip(mean) {
-                        *value = sample - center;
-                    }
-                    for i in 0..d {
-                        for j in i..d {
-                            cov[i * d + j] += delta[i] * delta[j];
-                        }
-                    }
-                }
-            }
+            add_centered(self.dims, self.data.row(p), mean, None, cov, 1.);
         }
         if let Some(cache) = cache {
             cache.class.clone_from(&self.class);
             cache.counts.clear();
             cache.counts.extend_from_slice(&counts);
-            // Most recursive fits have only one or two signal components.
-            // Retain only the prefix containing members, rather than copying
-            // the storage reserved for all 100 possible component IDs.
+            // Split fits have only one or two components; keep only the
+            // prefix with members, not all 100 slots.
             let columns = counts.iter().rposition(|&n| n > 0).unwrap_or(0) + 1;
             cache.scatter.clear();
             cache
@@ -406,21 +417,30 @@ impl State {
         }
     }
 
+    /// The same fit as [`Self::m_step`], updating the cached statistics with
+    /// only the spikes that changed cluster when few did. For a cluster with
+    /// count `n`, centre `μ` and scatter `S`, with entering/leaving spikes
+    /// summed about the *old* centre as `Δs = Σ±(x-μ)`, `ΔQ = Σ±(x-μ)(x-μ)ᵀ`:
+    ///
+    /// ```text
+    /// μ' = μ + Δs/n'      S' = S + ΔQ - Δs Δsᵀ/n'      cov' = S'/(n'-1)
+    /// ```
+    ///
+    /// Falls back to a full fit after large changes, a revived component, a
+    /// failed Cholesky check, or every 20 updates, to bound rounding drift.
     fn m_step_incremental(&mut self, cache: &mut Moments) {
-        let (n, d) = (self.data.points, self.data.dims);
+        let (n, d) = (self.data.points, self.dims.n());
         if cache.class.is_empty() || cache.age >= 19 {
-            self.m_step_full(Some(cache));
+            self.m_step(Some(cache));
             return;
         }
         cache.changes.clear();
         for (p, (&old, &new)) in cache.class.iter().zip(&self.class).enumerate() {
             if old != new {
                 cache.changes.push((p, old, new));
-                // Updates are useful only for small changes. New/revived
-                // groups and ill-conditioned downdates get the original fit.
                 if cache.changes.len() > n / 8 || (new != 0 && self.alive[new] && !cache.valid[new])
                 {
-                    self.m_step_full(Some(cache));
+                    self.m_step(Some(cache));
                     return;
                 }
             }
@@ -432,7 +452,6 @@ impl State {
         let mut delta_sum = vec![0.; MAX_CLUSTERS * d];
         let mut affected = [false; MAX_CLUSTERS];
         for &(p, old, new) in &cache.changes {
-            let point = self.data.row(p);
             cache.counts[old] -= 1;
             cache.counts[new] += 1;
             for (c, sign) in [(old, -1.), (new, 1.)] {
@@ -440,22 +459,14 @@ impl State {
                 if c == 0 || !cache.valid[c] {
                     continue;
                 }
-                let mean = &self.mean[c * d..(c + 1) * d];
-                let sum = &mut delta_sum[c * d..(c + 1) * d];
-                let scatter = &mut cache.scatter[c * d * d..(c + 1) * d * d];
-                match d {
-                    3 => adjust_moments_fixed::<3>(point, mean, sum, scatter, sign),
-                    12 => adjust_moments_fixed::<12>(point, mean, sum, scatter, sign),
-                    _ => {
-                        for i in 0..d {
-                            let delta_i = point[i] - mean[i];
-                            sum[i] += sign * delta_i;
-                            for j in i..d {
-                                scatter[i * d + j] += sign * delta_i * (point[j] - mean[j]);
-                            }
-                        }
-                    }
-                }
+                add_centered(
+                    self.dims,
+                    self.data.row(p),
+                    &self.mean[c * d..(c + 1) * d],
+                    Some(&mut delta_sum[c * d..(c + 1) * d]),
+                    &mut cache.scatter[c * d * d..(c + 1) * d * d],
+                    sign,
+                );
             }
         }
         for c in 1..MAX_CLUSTERS {
@@ -473,14 +484,12 @@ impl State {
             for i in 0..d {
                 mean[i] += sum[i] / count;
                 for j in i..d {
-                    // Both delta sums use the OLD center. Recenter only once,
-                    // after all additions/removals, avoiding raw E[x*x]-E[x]^2.
                     scatter[i * d + j] -= sum[i] * sum[j] / count;
                     cov[i * d + j] = scatter[i * d + j] / (count - 1.);
                 }
             }
             if cholesky(cov, d).is_none() {
-                self.m_step_full(Some(cache));
+                self.m_step(Some(cache));
                 return;
             }
         }
@@ -491,9 +500,10 @@ impl State {
         cache.valid.clone_from(&self.alive);
     }
 
-    fn gaussian(&self, c: usize) -> Option<Gaussian> {
-        let d = self.data.dims;
+    fn gaussian(&self, c: usize) -> Option<Gaussian<D>> {
+        let d = self.dims.n();
         Gaussian::new(
+            self.dims,
             c,
             &self.mean[c * d..(c + 1) * d],
             &self.cov[c * d * d..(c + 1) * d * d],
@@ -505,31 +515,23 @@ impl State {
         f64::from((-self.weight[0].ln()) as f32)
     }
 
+    /// Score spikes against every component. A quick (non-full) step skips
+    /// spikes that kept their cluster and were far from this one last time,
+    /// leaving their old score in place.
     fn e_step(&mut self, full: bool) {
         let n = self.data.points;
         let ids = self.ids();
         self.ensure_score_columns(ids.last().unwrap() + 1);
         let noise = self.noise_score();
         self.scores[..n].fill(noise);
-        let mut root = vec![0.; self.data.dims];
         for c in ids.into_iter().skip(1) {
             let Some(gaussian) = self.gaussian(c) else {
-                // Reindex immediately; never assign a point to a singular class
-                // using stale likelihoods, as the old implementation could do.
+                // Singular covariance: remove the component immediately.
                 self.alive[c] = false;
                 continue;
             };
             if full {
-                let column = &mut self.scores[c * n..(c + 1) * n];
-                match self.data.dims {
-                    3 => gaussian.score_all_fixed::<3>(&self.data, column),
-                    12 => gaussian.score_all_fixed::<12>(&self.data, column),
-                    _ => {
-                        for (p, score) in column.iter_mut().enumerate() {
-                            *score = gaussian.score(self.data.row(p), &mut root);
-                        }
-                    }
-                }
+                gaussian.score_all(&self.data, &mut self.scores[c * n..(c + 1) * n]);
                 continue;
             }
             for p in 0..n {
@@ -538,11 +540,13 @@ impl State {
                 {
                     continue;
                 }
-                self.scores[c * n + p] = gaussian.score(self.data.row(p), &mut root);
+                self.scores[c * n + p] = gaussian.score(self.data.row(p));
             }
         }
     }
 
+    /// Assign each spike its best component and remember the runner-up.
+    /// Ties go to the lower component ID.
     fn c_step(&mut self, noise: bool) -> bool {
         let n = self.data.points;
         let candidates: Vec<_> = self
@@ -554,7 +558,7 @@ impl State {
         if candidates.is_empty() {
             return false;
         }
-        for p in 0..self.data.points {
+        for p in 0..n {
             self.old_class[p] = self.class[p];
             let (mut best, mut second) = ((0, f64::INFINITY), (0, f64::INFINITY));
             for &(c, scores) in &candidates {
@@ -571,6 +575,8 @@ impl State {
         true
     }
 
+    /// Delete the component whose spikes lose least by moving to their
+    /// runner-up, if that loss is smaller than the BIC penalty saved.
     fn delete(&mut self) -> bool {
         let ids = self.ids();
         if ids.len() <= 1 {
@@ -586,8 +592,7 @@ impl State {
             .skip(1)
             .min_by(|&&a, &&b| losses[a].total_cmp(&losses[b]))
             .unwrap();
-        let gain = penalty(self.data.points, self.data.dims, 2);
-        if losses[candidate] >= gain {
+        if losses[candidate] >= penalty(n, self.dims.n(), 2) {
             return false;
         }
         self.alive[candidate] = false;
@@ -599,8 +604,9 @@ impl State {
         true
     }
 
+    /// Total score of the current assignments plus the BIC penalty.
     fn score(&self) -> f64 {
-        let mut score = penalty(self.data.points, self.data.dims, self.ids().len());
+        let mut score = penalty(self.data.points, self.dims.n(), self.ids().len());
         for (p, &c) in self.class.iter().enumerate() {
             if c > 0 && !self.alive[c] {
                 return f64::INFINITY;
@@ -610,23 +616,15 @@ impl State {
         score
     }
 
+    /// Run classification EM to convergence. `recurse` enables deletion and
+    /// split proposals; `noise` lets spikes be assigned to the noise component.
     fn cem(
         &mut self,
         options: &Options,
         random: &mut Random,
         recurse: bool,
         noise: bool,
-    ) -> Result<f64> {
-        self.cem_observed(options, random, recurse, noise, None)
-    }
-
-    fn cem_observed(
-        &mut self,
-        options: &Options,
-        random: &mut Random,
-        recurse: bool,
-        noise: bool,
-        mut report: Option<&mut dyn FnMut(usize, usize, bool) -> Result<()>>,
+        report: &mut dyn FnMut(usize, usize, bool) -> Result<()>,
     ) -> Result<f64> {
         let mut score = f64::INFINITY;
         let mut full = true;
@@ -657,29 +655,12 @@ impl State {
             let split_due = iteration == 20
                 || (iteration > 20 && (iteration - 20) % 40 == 39)
                 || (changed == 0 && last_full);
-            if let Some(report) = report.as_mut() {
-                report(
-                    iteration,
-                    self.alive.iter().skip(1).filter(|&&v| v).count(),
-                    false,
-                )?;
-            }
+            let clusters = |state: &Self| state.alive.iter().skip(1).filter(|&&v| v).count();
+            report(iteration, clusters(self), false)?;
             let split = if recurse && split_due {
-                if let Some(report) = report.as_mut() {
-                    report(
-                        iteration,
-                        self.alive.iter().skip(1).filter(|&&v| v).count(),
-                        true,
-                    )?;
-                }
+                report(iteration, clusters(self), true)?;
                 let split = self.try_splits(options, random)?;
-                if let Some(report) = report.as_mut() {
-                    report(
-                        iteration,
-                        self.alive.iter().skip(1).filter(|&&v| v).count(),
-                        false,
-                    )?;
-                }
+                report(iteration, clusters(self), false)?;
                 split
             } else {
                 false
@@ -694,6 +675,9 @@ impl State {
         )))
     }
 
+    /// For each cluster, fit one and two clusters to its spikes alone. Where
+    /// two fit better, accept the split if it improves the whole model's
+    /// score relative to the score at the start of this pass.
     fn try_splits(&mut self, options: &Options, random: &mut Random) -> Result<bool> {
         let ids = self.ids();
         if ids.len() >= MAX_CLUSTERS - 1 {
@@ -714,15 +698,15 @@ impl State {
             let Some(unused) = (1..MAX_CLUSTERS).find(|&c| !self.alive[c]) else {
                 break;
             };
-            let mut local = State::new(Arc::new(self.data.subset(&indices)));
+            let mut local = State::new(self.dims, Arc::new(self.data.subset(&indices)));
             local.initialize(2, random);
-            let unsplit = local.cem(options, random, false, false)?;
+            let unsplit = local.cem(options, random, false, false, &mut |_, _, _| Ok(()))?;
             local.initialize(3, random);
-            let split = local.cem(options, random, false, false)?;
+            let split = local.cem(options, random, false, false, &mut |_, _, _| Ok(()))?;
             if split >= unsplit || !split.is_finite() || local.ids().len() < 3 {
                 continue;
             }
-            let mut proposal = State::new(Arc::clone(&self.data));
+            let mut proposal = State::new(self.dims, Arc::clone(&self.data));
             proposal.class.clone_from(&self.class);
             for (p, &source) in indices.iter().enumerate() {
                 proposal.class[source] = if local.class[p] == 1 { c } else { unused };
@@ -730,10 +714,9 @@ impl State {
             for &class in &proposal.class {
                 proposal.alive[class] = true;
             }
-            proposal.m_step();
+            proposal.m_step(None);
             proposal.e_step(true);
-            // As in classic KlustaKwik, score the proposed assignments without
-            // a C-step, against the score at the beginning of this split pass.
+            // Score the proposed assignments as they are, without a C-step.
             if proposal.score() < baseline {
                 self.ensure_score_columns(proposal.scores.len() / self.data.points);
                 self.class = proposal.class;
@@ -744,7 +727,7 @@ impl State {
         Ok(did_split)
     }
 
-    fn model(&self) -> Model {
+    fn model(&self) -> Model<D> {
         Model {
             noise_score: self.noise_score(),
             gaussians: self
@@ -755,9 +738,57 @@ impl State {
                 .collect(),
         }
     }
+
+    /// Weights, means and full covariances indexed by component ID (0 is
+    /// noise). Means and covariances are NaN where there is no Gaussian.
+    fn dump_model(&self, dump: &Dump, trial: usize) -> Result<()> {
+        let d = self.dims.n();
+        let k = self.ids().last().unwrap() + 1;
+        let fitted = |c: usize| c > 0 && self.alive[c];
+        let name = |part: &str| format!("trial_{trial}_{part}");
+        dump.array(
+            Point::Models,
+            &name("weights"),
+            &[k],
+            (0..k).map(|c| {
+                if c == 0 || fitted(c) {
+                    self.weight[c]
+                } else {
+                    0.
+                }
+            }),
+        )?;
+        dump.array(
+            Point::Models,
+            &name("means"),
+            &[k, d],
+            (0..k * d).map(|i| {
+                if fitted(i / d) {
+                    self.mean[i]
+                } else {
+                    f64::NAN
+                }
+            }),
+        )?;
+        dump.array(
+            Point::Models,
+            &name("covariances"),
+            &[k, d, d],
+            (0..k * d * d).map(|index| {
+                let (c, i, j) = (index / (d * d), index / d % d, index % d);
+                let upper = c * d * d + i.min(j) * d + i.max(j);
+                if fitted(c) {
+                    self.cov[upper]
+                } else {
+                    f64::NAN
+                }
+            }),
+        )
+    }
 }
 
 pub struct Output {
+    /// One byte per spike: the winning trial's component IDs.
     pub labels: PathBuf,
     pub counts: [usize; MAX_CLUSTERS],
     pub score: f64,
@@ -765,28 +796,38 @@ pub struct Output {
     pub stride: usize,
 }
 
+/// The fitting subset: one random spike from each complete interval of
+/// `stride = max(1, floor(N / target))`, giving `floor(N / stride)` spikes.
 fn sampling_plan(points: usize, target: usize) -> (usize, usize) {
     let stride = (points / target).max(1);
     (stride, points / stride)
 }
 
-/// Try each initial count once, comparing scores on the full recording. Each
-/// trial draws a fresh stratified subset, matching runkk.bat and -Subset.
-pub fn run(
-    store: &FeatureStore,
-    options: &Options,
-    work: &Path,
-    log: &mut dyn Write,
-) -> Result<Output> {
-    run_observed(store, options, work, log, &mut |_| Ok(()))
-}
-
-pub(crate) fn run_observed(
+pub(crate) fn run(
     store: &FeatureStore,
     options: &Options,
     work: &Path,
     log: &mut dyn Write,
     notify: &mut dyn FnMut(Update) -> Result<()>,
+    dump: &Dump,
+) -> Result<Output> {
+    match store.dims() {
+        3 => run_with(Fixed::<3>, store, options, work, log, notify, dump),
+        6 => run_with(Fixed::<6>, store, options, work, log, notify, dump),
+        9 => run_with(Fixed::<9>, store, options, work, log, notify, dump),
+        12 => run_with(Fixed::<12>, store, options, work, log, notify, dump),
+        d => run_with(d, store, options, work, log, notify, dump),
+    }
+}
+
+fn run_with<D: Dims>(
+    dims: D,
+    store: &FeatureStore,
+    options: &Options,
+    work: &Path,
+    log: &mut dyn Write,
+    notify: &mut dyn FnMut(Update) -> Result<()>,
+    dump: &Dump,
 ) -> Result<Output> {
     options.validate()?;
     let (stride, fitting_spikes) = sampling_plan(store.points, options.target_spikes);
@@ -802,7 +843,6 @@ pub(crate) fn run_observed(
     )?;
     let mut random = Random(options.seed);
     let mut best: Option<Output> = None;
-    let mut root = vec![0.; store.dims()];
     let profile = std::env::var_os("LTXK_PROFILE").is_some();
     for starting in options.min_clusters..=options.max_clusters {
         notify(Update::Trial {
@@ -820,9 +860,14 @@ pub(crate) fn run_observed(
                 }
             })
             .collect();
-        let data = Arc::new(store.load_indices(&indices)?);
+        dump.array(
+            Point::Subsets,
+            &format!("trial_{starting}_subset"),
+            &[indices.len()],
+            indices.iter().map(|&i| i as u32),
+        )?;
+        let mut state = State::new(dims, Arc::new(store.load_indices(&indices)?));
         let loaded = Instant::now();
-        let mut state = State::new(data);
         notify(Update::Stage(Stage::Fitting))?;
         let fitted_score = if store.dims() == 0 {
             state.alive[0] = true;
@@ -838,9 +883,12 @@ pub(crate) fn run_observed(
                     splitting,
                 })
             };
-            state.cem_observed(options, &mut random, true, true, Some(&mut report))?
+            state.cem(options, &mut random, true, true, &mut report)?
         };
         let fitted = Instant::now();
+        state.dump_model(dump, starting)?;
+
+        // Label every spike: the fit's own labels, or the model's best match.
         let model = state.model();
         let candidate = work.join("candidate.labels");
         let mut labels = BufWriter::with_capacity(1 << 20, File::create(&candidate)?);
@@ -856,7 +904,7 @@ pub(crate) fn run_observed(
             score = penalty(store.points, store.dims(), state.ids().len());
             let mut assigned = 0_usize;
             store.for_each(|row| {
-                let (class, value) = model.best(row, &mut root);
+                let (class, value) = model.best(row);
                 counts[class] += 1;
                 score += value;
                 labels.write_all(&[class as u8])?;
@@ -868,10 +916,19 @@ pub(crate) fn run_observed(
             })?;
         }
         labels.flush()?;
+        drop(labels);
         notify(Update::Assigned {
             count: store.points,
         })?;
-        drop(labels);
+        if dump.wants(Point::Labels) {
+            let name = format!("trial_{starting}_labels");
+            dump.array(
+                Point::Labels,
+                &name,
+                &[store.points],
+                std::fs::read(&candidate)?,
+            )?;
+        }
         if profile {
             writeln!(
                 log,
@@ -896,8 +953,6 @@ pub(crate) fn run_observed(
         )?;
         if best.as_ref().is_none_or(|best| score < best.score) {
             let path = work.join("best.labels");
-            // Both files are private scratch files. Copy replaces an earlier
-            // best trial on Windows too, without touching the final .clu file.
             std::fs::copy(&candidate, &path)?;
             best = Some(Output {
                 labels: path,
@@ -915,13 +970,27 @@ pub(crate) fn run_observed(
 mod tests {
     use super::*;
 
+    fn data(dims: usize, values: Vec<f64>) -> Arc<Data> {
+        Arc::new(Data {
+            dims,
+            points: values.len() / dims,
+            values,
+        })
+    }
+
+    /// Deterministic values in [0, 1) for synthetic feature sets.
+    fn pattern(points: usize, dims: usize) -> Arc<Data> {
+        data(
+            dims,
+            (0..points * dims)
+                .map(|i| ((i * 37 + i / dims * 19) % 101) as f64 / 100.)
+                .collect(),
+        )
+    }
+
     #[test]
     fn score_columns_grow_without_discarding_quick_step_history() {
-        let mut state = State::new(Arc::new(Data {
-            dims: 1,
-            points: 2,
-            values: vec![0., 1.],
-        }));
+        let mut state = State::new(1, data(1, vec![0., 1.]));
         state.ensure_score_columns(2);
         state
             .scores
@@ -942,11 +1011,7 @@ mod tests {
 
     #[test]
     fn column_scores_keep_ascending_ties_and_noise_exclusion() {
-        let mut state = State::new(Arc::new(Data {
-            dims: 1,
-            points: 3,
-            values: vec![0.; 3],
-        }));
+        let mut state = State::new(1, data(1, vec![0.; 3]));
         state.alive[1..3].fill(true);
         state.ensure_score_columns(3);
         state
@@ -971,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_random_sequence() {
+    fn random_sequence_matches_msvc_rand() {
         let mut random = Random(1);
         assert_eq!(
             (0..5)
@@ -983,9 +1048,8 @@ mod tests {
 
     #[test]
     fn gaussian_score_uses_full_covariance() {
-        let gaussian = Gaussian::new(1, &[1., 2.], &[4., 2., 0., 3.], 0.25).unwrap();
-        let mut root = [0.; 2];
-        let score = gaussian.score(&[3., 5.], &mut root);
+        let gaussian = Gaussian::new(2, 1, &[1., 2.], &[4., 2., 0., 3.], 0.25).unwrap();
+        let score = gaussian.score(&[3., 5.]);
         // det=8; delta' inv(cov) delta = 3, including the cross term.
         assert!(
             (score
@@ -996,121 +1060,87 @@ mod tests {
         assert!(cholesky(&[1., 1., 0., 1.], 2).is_none());
     }
 
-    #[test]
-    fn specialized_gaussians_match_division_reference_and_correlated_systems() {
-        let mut random = Random(425);
-        for dims in [3, 12] {
-            let mean = vec![0.5; dims];
-            let mut lower = vec![0.; dims * dims];
-            for i in 0..dims {
-                for j in 0..=i {
-                    lower[i * dims + j] = if i == j {
-                        1. + random.inclusive(0, 1000) as f64 / 1000.
-                    } else {
-                        random.inclusive(0, 1000) as f64 / 10000. - 0.05
-                    };
-                }
-            }
-            let mut cov = vec![0.; dims * dims];
-            for i in 0..dims {
-                for j in i..dims {
-                    cov[i * dims + j] = (0..dims)
-                        .map(|k| lower[i * dims + k] * lower[j * dims + k])
-                        .sum();
-                }
-            }
-            let gaussian = Gaussian::new(1, &mean, &cov, 0.9).unwrap();
-            let offset: f64 = (0..dims)
-                .map(|i| f64::from(lower[i * dims + i].ln() as f32))
-                .sum::<f64>()
-                - 0.9_f64.ln()
-                + f64::from((2. * std::f64::consts::PI).ln() as f32) * dims as f64 / 2.;
-            for _ in 0..64 {
-                let z: Vec<_> = (0..dims)
-                    .map(|_| random.inclusive(0, 2000) as f64 / 1000. - 1.)
-                    .collect();
-                let point: Vec<_> = (0..dims)
-                    .map(|i| mean[i] + (0..dims).map(|j| lower[i * dims + j] * z[j]).sum::<f64>())
-                    .collect();
-                let actual = gaussian.score(&point, &mut vec![0.; dims]);
-                let fallback = gaussian.score_dynamic(&point, &mut vec![0.; dims]);
-                assert!((actual - fallback).abs() <= 16. * f64::EPSILON * (1. + fallback.abs()));
-                let expected = z.iter().map(|x| x * x).sum::<f64>() / 2. + offset;
-                assert!((actual - expected).abs() < 1e-6);
-            }
-        }
-    }
-
-    // Original scalar reciprocal solve, before loop unrolling and batching.
-    fn scalar_reciprocal_reference(gaussian: &Gaussian, point: &[f64]) -> f64 {
+    /// A one-spike solve written as plainly as possible.
+    fn reference_score<D: Dims>(gaussian: &Gaussian<D>, point: &[f64]) -> f64 {
         let d = gaussian.mean.len();
-        let mut root = vec![0.; d];
+        let mut z = vec![0.; d];
         for i in 0..d {
             let mut value = point[i] - gaussian.mean[i];
-            for (j, &previous) in root[..i].iter().enumerate() {
+            for (j, &previous) in z[..i].iter().enumerate() {
                 value -= gaussian.lower[i * d + j] * previous;
             }
-            root[i] = value * gaussian.inverse_diagonal[i];
+            z[i] = value * gaussian.inverse_diagonal[i];
         }
-        root.iter().map(|x| x * x).sum::<f64>() / 2. + gaussian.offset
+        z.iter().map(|x| x * x).sum::<f64>() / 2. + gaussian.offset
     }
 
-    fn check_batched_scores<const D: usize>() {
-        let mut lower = [[0.; D]; D];
-        for (i, row) in lower.iter_mut().enumerate() {
-            for (j, value) in row[..=i].iter_mut().enumerate() {
-                *value = if i == j {
+    fn correlated_gaussian<D: Dims>(dims: D) -> (Gaussian<D>, Vec<f64>) {
+        let d = dims.n();
+        let mut lower = vec![0.; d * d];
+        for i in 0..d {
+            for j in 0..=i {
+                lower[i * d + j] = if i == j {
                     0.25 + i as f64 / 32.
                 } else {
                     (i + j) as f64 / 256.
                 };
             }
         }
-        let mut cov = vec![0.; D * D];
-        for i in 0..D {
-            for j in i..D {
-                cov[i * D + j] = (0..D).map(|k| lower[i][k] * lower[j][k]).sum();
+        let mut cov = vec![0.; d * d];
+        for i in 0..d {
+            for j in i..d {
+                cov[i * d + j] = (0..d).map(|k| lower[i * d + k] * lower[j * d + k]).sum();
             }
         }
-        let gaussian = Gaussian::new(1, &[0.5; D], &cov, 0.7).unwrap();
-        for n in 1..=33 {
-            let data = Data {
-                dims: D,
-                points: n,
-                values: (0..n * D)
-                    .map(|i| ((i * 37 + i / D * 19) % 101) as f64 / 25. - 2.)
-                    .collect(),
-            };
+        (
+            Gaussian::new(dims, 1, &vec![0.5; d], &cov, 0.7).unwrap(),
+            lower,
+        )
+    }
+
+    fn check_scores<D: Dims>(dims: D) {
+        let d = dims.n();
+        let (gaussian, lower) = correlated_gaussian(dims);
+        // Analytic: a point mean + L z scores |z|²/2 + offset.
+        let z: Vec<f64> = (0..d).map(|i| (i as f64 - 4.) / 7.).collect();
+        let point: Vec<f64> = (0..d)
+            .map(|i| 0.5 + (0..=i).map(|j| lower[i * d + j] * z[j]).sum::<f64>())
+            .collect();
+        let expected = z.iter().map(|x| x * x).sum::<f64>() / 2. + gaussian.offset;
+        assert!((gaussian.score(&point) - expected).abs() < 1e-9);
+        // Batched and single scores match the plain solve bit for bit,
+        // including partial batches.
+        for n in 1..=9 {
+            let data = pattern(n, d);
             let expected: Vec<_> = (0..n)
-                .map(|p| scalar_reciprocal_reference(&gaussian, data.row(p)).to_bits())
+                .map(|p| reference_score(&gaussian, data.row(p)).to_bits())
                 .collect();
             let mut actual = vec![f64::INFINITY; n];
-            gaussian.score_all_fixed::<D>(&data, &mut actual);
+            gaussian.score_all(&data, &mut actual);
             assert_eq!(
                 actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                 expected
             );
             for (p, &expected) in expected.iter().enumerate() {
-                assert_eq!(
-                    gaussian.score(data.row(p), &mut [0.; D]).to_bits(),
-                    expected
-                );
-            }
-            // Quick steps gather nonadjacent rows, including repeated points.
-            let indices = [n - 1, 0, n / 2, n - 1];
-            let scores = gaussian.score_batch_fixed::<D, 4>(std::array::from_fn(|b| {
-                data.row(indices[b]).try_into().unwrap()
-            }));
-            for b in 0..4 {
-                assert_eq!(scores[b].to_bits(), expected[indices[b]]);
+                assert_eq!(gaussian.score(data.row(p)).to_bits(), expected);
             }
         }
     }
 
     #[test]
-    fn unrolled_and_batched_likelihoods_keep_scalar_arithmetic() {
-        check_batched_scores::<3>();
-        check_batched_scores::<12>();
+    fn fixed_and_runtime_dimensions_score_identically() {
+        check_scores(Fixed::<3>);
+        check_scores(Fixed::<12>);
+        check_scores(3_usize);
+        check_scores(7_usize);
+        check_scores(12_usize);
+        let (fixed, _) = correlated_gaussian(Fixed::<12>);
+        let (runtime, _) = correlated_gaussian(12_usize);
+        let data = pattern(33, 12);
+        let (mut a, mut b) = (vec![0.; 33], vec![0.; 33]);
+        fixed.score_all(&data, &mut a);
+        runtime.score_all(&data, &mut b);
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -1118,14 +1148,7 @@ mod tests {
         for dims in [3, 12] {
             for n in 208..=213 {
                 for full in [false, true] {
-                    let data = Arc::new(Data {
-                        dims,
-                        points: n,
-                        values: (0..n * dims)
-                            .map(|i| ((i * 37 + i / dims * 19) % 101) as f64 / 100.)
-                            .collect(),
-                    });
-                    let mut state = State::new(data);
+                    let mut state = State::new(dims, pattern(n, dims));
                     state.class = (0..n).map(|p| [0, 1, 7][p % 3]).collect();
                     state.old_class = state
                         .class
@@ -1165,8 +1188,7 @@ mod tests {
                             {
                                 continue;
                             }
-                            expected[c * n + p] =
-                                scalar_reciprocal_reference(&gaussian, state.data.row(p));
+                            expected[c * n + p] = reference_score(&gaussian, state.data.row(p));
                         }
                     }
                     state.e_step(full);
@@ -1186,42 +1208,36 @@ mod tests {
             for i in 0..3 {
                 covariance[i * 3 + i] = variance;
             }
-            let gaussian = Gaussian::new(1, &[0.; 3], &covariance, 0.7).unwrap();
+            let gaussian = Gaussian::new(Fixed::<3>, 1, &[0.; 3], &covariance, 0.7).unwrap();
             assert!(gaussian
                 .inverse_diagonal
                 .iter()
                 .all(|x| x.is_finite() && *x > 0.));
             let scale = variance.sqrt();
-            let point = [scale, 2. * scale, 3. * scale];
-            let actual = gaussian.score(&point, &mut [0.; 3]);
-            let reference = gaussian.score_dynamic(&point, &mut [0.; 3]);
-            assert!((actual - reference).abs() <= 16. * f64::EPSILON * (1. + reference.abs()));
+            // z = (1, 2, 3) exactly, up to rounding of the reciprocal.
+            let score = gaussian.score(&[scale, 2. * scale, 3. * scale]);
+            let expected = 7. + gaussian.offset;
+            assert!((score - expected).abs() <= 16. * f64::EPSILON * (1. + expected.abs()));
         }
     }
 
     #[test]
     fn uniform_noise_wins_for_outliers_but_not_for_a_gaussian_peak() {
-        let gaussian = Gaussian::new(1, &[0.2, 0.2], &[0.0001, 0., 0., 0.0001], 0.9).unwrap();
+        let gaussian = Gaussian::new(2, 1, &[0.2, 0.2], &[0.0001, 0., 0., 0.0001], 0.9).unwrap();
         let model = Model {
             noise_score: -0.1_f64.ln(),
             gaussians: vec![gaussian],
         };
-        let mut root = [0.; 2];
-        assert_eq!(model.best(&[0.2, 0.2], &mut root).0, 1);
-        assert_eq!(model.best(&[0.9, 0.9], &mut root).0, 0);
+        assert_eq!(model.best(&[0.2, 0.2]).0, 1);
+        assert_eq!(model.best(&[0.9, 0.9]).0, 0);
     }
 
     #[test]
     fn m_step_unbiased_covariance_and_noise_pseudocount() {
-        let data = Arc::new(Data {
-            dims: 1,
-            points: 4,
-            values: vec![0., 1., 2., 3.],
-        });
-        let mut state = State::new(data);
+        let mut state = State::new(1, data(1, vec![0., 1., 2., 3.]));
         state.class.fill(1);
         state.alive[1] = true;
-        state.m_step();
+        state.m_step(None);
         assert_eq!(state.weight[0], 0.2);
         assert_eq!(state.weight[1], 0.8);
         assert_eq!(state.mean[1], 1.5);
@@ -1230,37 +1246,33 @@ mod tests {
     }
 
     #[test]
-    fn common_dimension_covariances_match_global_moments() {
-        for dims in [3, 12] {
-            let points = 64;
-            let values = (0..points * dims)
-                .map(|i| ((i * 37 + i / dims * 19) % 101) as f64 / 100.)
-                .collect();
-            let data = Arc::new(Data {
-                points,
-                dims,
-                values,
-            });
-            let mut state = State::new(Arc::clone(&data));
+    fn covariances_match_global_moments() {
+        fn check<D: Dims>(dims: D) {
+            let (points, d) = (64, dims.n());
+            let data = pattern(points, d);
+            let mut state = State::new(dims, Arc::clone(&data));
             state.class.fill(1);
             state.alive[1] = true;
-            state.m_step();
-            for i in 0..dims {
+            state.m_step(None);
+            for i in 0..d {
                 let sum_i: f64 = (0..points).map(|p| data.row(p)[i]).sum();
-                assert!((state.mean[dims + i] - sum_i / points as f64).abs() < 1e-14);
-                for j in i..dims {
+                assert!((state.mean[d + i] - sum_i / points as f64).abs() < 1e-14);
+                for j in i..d {
                     let sum_j: f64 = (0..points).map(|p| data.row(p)[j]).sum();
                     let sum_ij: f64 = (0..points).map(|p| data.row(p)[i] * data.row(p)[j]).sum();
                     let expected = (sum_ij - sum_i * sum_j / points as f64) / (points - 1) as f64;
-                    assert!((state.cov[dims * dims + i * dims + j] - expected).abs() < 1e-12);
+                    assert!((state.cov[d * d + i * d + j] - expected).abs() < 1e-12);
                 }
             }
         }
+        check(Fixed::<3>);
+        check(Fixed::<12>);
+        check(5_usize);
     }
 
-    fn assert_same_moments(actual: &State, expected: &State, tolerance: f64) {
+    fn assert_same_moments<D: Dims>(actual: &State<D>, expected: &State<D>, tolerance: f64) {
         assert_eq!(actual.alive, expected.alive);
-        let d = actual.data.dims;
+        let d = actual.dims.n();
         for c in actual.ids() {
             assert_eq!(actual.weight[c], expected.weight[c]);
             if c == 0 {
@@ -1283,17 +1295,11 @@ mod tests {
 
     #[test]
     fn incremental_moments_match_fresh_fits_after_exchanges_and_noise_moves() {
-        for dims in [1, 3, 7, 12] {
+        fn check<D: Dims>(dims: D) {
             let points = 512;
-            let data = Arc::new(Data {
-                points,
-                dims,
-                values: (0..points * dims)
-                    .map(|i| ((i * 37 + i / dims * 19) % 101) as f64 / 100.)
-                    .collect(),
-            });
-            let mut updated = State::new(Arc::clone(&data));
-            let mut fresh = State::new(data);
+            let data = pattern(points, dims.n());
+            let mut updated = State::new(dims, Arc::clone(&data));
+            let mut fresh = State::new(dims, data);
             updated.class = (0..points).map(|i| 1 + i % 2).collect();
             updated.alive[1..3].fill(true);
             let mut cache = Moments::default();
@@ -1308,23 +1314,26 @@ mod tests {
                 fresh.class.clone_from(&updated.class);
                 fresh.alive.clone_from(&updated.alive);
                 updated.m_step_incremental(&mut cache);
-                fresh.m_step();
+                fresh.m_step(None);
                 assert_same_moments(&updated, &fresh, 2e-14);
                 assert_eq!(cache.class, updated.class);
                 assert!(cache.age < 20);
             }
         }
+        check(1_usize);
+        check(Fixed::<3>);
+        check(7_usize);
+        check(Fixed::<12>);
     }
 
     #[test]
     fn incremental_moments_refresh_after_deletion_revival_and_reinitialization() {
         let points = 200;
-        let data = Arc::new(Data {
-            points,
-            dims: 1,
-            values: (0..points).map(|p| (p * 37 % 101) as f64 / 100.).collect(),
-        });
-        let mut state = State::new(Arc::clone(&data));
+        let data = data(
+            1,
+            (0..points).map(|p| (p * 37 % 101) as f64 / 100.).collect(),
+        );
+        let mut state = State::new(1, Arc::clone(&data));
         state.class = (0..points).map(|p| 1 + usize::from(p < 5)).collect();
         state.alive[1..3].fill(true);
         let mut cache = Moments::default();
@@ -1338,10 +1347,10 @@ mod tests {
         state.alive[2] = true;
         state.m_step_incremental(&mut cache);
         assert_eq!(cache.age, 0);
-        let mut fresh = State::new(data);
+        let mut fresh = State::new(1, data);
         fresh.class.clone_from(&state.class);
         fresh.alive.clone_from(&state.alive);
-        fresh.m_step();
+        fresh.m_step(None);
         assert_same_moments(&state, &fresh, f64::EPSILON);
         state.initialize(4, &mut Random(1));
         state.m_step_incremental(&mut cache);
@@ -1351,11 +1360,7 @@ mod tests {
 
     #[test]
     fn incremental_downdate_rebuilds_before_discarding_a_singular_cluster() {
-        let mut state = State::new(Arc::new(Data {
-            points: 100,
-            dims: 1,
-            values: (0..100).map(|p| f64::from(p == 0)).collect(),
-        }));
+        let mut state = State::new(1, data(1, (0..100).map(|p| f64::from(p == 0)).collect()));
         state.class.fill(1);
         state.alive[1] = true;
         let mut cache = Moments::default();
@@ -1374,24 +1379,23 @@ mod tests {
     #[test]
     fn incremental_moments_keep_small_variances_around_a_large_center() {
         let points = 256;
-        let data = Arc::new(Data {
-            points,
-            dims: 1,
-            values: (0..points)
+        let data = data(
+            1,
+            (0..points)
                 .map(|p| 0.75 + (p * 37 % 101) as f64 * 1e-10)
                 .collect(),
-        });
-        let mut updated = State::new(Arc::clone(&data));
+        );
+        let mut updated = State::new(1, Arc::clone(&data));
         updated.class = (0..points).map(|p| 1 + p % 2).collect();
         updated.alive[1..3].fill(true);
-        let mut fresh = State::new(data);
+        let mut fresh = State::new(1, data);
         let mut cache = Moments::default();
         for iteration in 0..100 {
             updated.class[iteration] = 3 - updated.class[iteration];
             updated.m_step_incremental(&mut cache);
             fresh.class.clone_from(&updated.class);
             fresh.alive.clone_from(&updated.alive);
-            fresh.m_step();
+            fresh.m_step(None);
             for c in 1..3 {
                 assert!((updated.mean[c] - fresh.mean[c]).abs() < 2e-15);
                 assert!((updated.cov[c] / fresh.cov[c] - 1.).abs() < 2e-6);
@@ -1401,11 +1405,7 @@ mod tests {
 
     #[test]
     fn deletion_reassigns_to_runner_up_when_bic_gain_exceeds_loss() {
-        let mut state = State::new(Arc::new(Data {
-            dims: 1,
-            points: 4,
-            values: vec![0.; 4],
-        }));
+        let mut state = State::new(1, data(1, vec![0.; 4]));
         state.alive[1] = true;
         state.class.fill(1);
         state.second.fill(0);
@@ -1419,14 +1419,12 @@ mod tests {
 
     #[test]
     fn split_search_recovers_two_well_separated_populations() {
-        let values: Vec<_> = (0..400)
-            .map(|i| (i % 2) as f64 * 0.8 + (i * 37 % 101) as f64 / 1000.)
-            .collect();
-        let data = Arc::new(Data {
-            dims: 1,
-            points: values.len(),
-            values,
-        });
+        let data = data(
+            1,
+            (0..400)
+                .map(|i| (i % 2) as f64 * 0.8 + (i * 37 % 101) as f64 / 1000.)
+                .collect(),
+        );
         let options = Options {
             min_clusters: 2,
             max_clusters: 2,
@@ -1435,10 +1433,12 @@ mod tests {
         // CEM uses random split proposals, so a single proposal can collapse.
         let mut recovered = false;
         for seed in 1..=32 {
-            let mut state = State::new(Arc::clone(&data));
+            let mut state = State::new(1, Arc::clone(&data));
             let mut random = Random(seed);
             state.initialize(2, &mut random);
-            let score = state.cem(&options, &mut random, true, true).unwrap();
+            let score = state
+                .cem(&options, &mut random, true, true, &mut |_, _, _| Ok(()))
+                .unwrap();
             assert!(score.is_finite());
             if state.class[0] != state.class[1] {
                 assert!(state

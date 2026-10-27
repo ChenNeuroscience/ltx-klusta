@@ -1,4 +1,4 @@
-"""Package the single executable, documentation, checksums, and dependency notices."""
+"""Package the executable, user documentation, checksums, and dependency notices."""
 import argparse
 import hashlib
 import os
@@ -7,22 +7,20 @@ import shutil
 import subprocess
 import tomllib
 
+from create_macos_app import create as create_macos_app
+
 
 def package(exe, output, platform):
     output.mkdir(parents=True)
     shutil.copy2(exe, output / ("ltxk.exe" if platform == "windows" else "ltxk"))
-    shutil.copy2("README.md", output / "README.md")
-    shutil.copy2("ltxk.example.json", output / "ltxk.example.json")
-    shutil.copy2("CLUSTERING.md", output / "CLUSTERING.md")
-    shutil.copy2("PERFORMANCE.md", output / "PERFORMANCE.md")
-    if platform == "windows":
-        for name in ("runkk.bat", "open-logs.bat"):
-            # cmd.exe launchers use Windows line endings in every package.
-            (output / name).write_bytes(Path("scripts/windows", name).read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    for name in ("README.md", "CLUSTERING.md", "ltxk.example.json"):
+        shutil.copy2(name, output / name)
+    if platform == "macos":
+        create_macos_app(exe, output / "ltx-klusta.app")
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     compiler = subprocess.check_output(["rustc", "-vV"], text=True)
     (output / "BUILD.txt").write_text(
-        f"Source commit: {commit}\nBackends: nalgebra, optional runtime LAPACK\nDefault: nalgebra\n\n{compiler}", encoding="utf-8")
+        f"Source commit: {commit}\n\n{compiler}", encoding="utf-8")
     cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
     registry = cargo_home / "registry" / "src"
     notices = []
@@ -39,9 +37,17 @@ def package(exe, output, platform):
         raise RuntimeError("Dependency licence notices were not found in the Cargo registry")
     (output / "THIRD_PARTY_NOTICES.txt").write_text("".join(notices), encoding="utf-8")
     checksums = [f"{hashlib.sha256(item.read_bytes()).hexdigest()}  {item.name}\n"
-                 for item in sorted(output.iterdir())]
+                 for item in sorted(output.iterdir()) if item.is_file()]
     (output / "SHA256SUMS.txt").write_text("".join(checksums), encoding="utf-8")
-    print(f"Packaged one {platform} executable in {output}; no numerical DLLs")
+    archive = output.with_suffix(".zip")
+    if platform == "macos":
+        # ditto keeps the app bundle's permissions and code signature intact.
+        subprocess.run(["/usr/bin/ditto", "-c", "-k", "--keepParent", str(output), str(archive)], check=True)
+    else:
+        shutil.make_archive(str(output), "zip", output.parent, output.name)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    archive.with_suffix(".zip.sha256").write_text(f"{digest}  {archive.name}\n")
+    print(f"Packaged the {platform} build in {output} and {archive}")
 
 
 if __name__ == "__main__":
