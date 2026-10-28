@@ -51,18 +51,27 @@ def check_plain(exe, root):
     bad.write_bytes(b"malformed")
     flags = ["--queue-dir", str(queue), "--target-spikes", "250", "--min-clusters", "2", "--max-clusters", "4"]
     coordinator = holder(queue)
+    second = None
     with (root / "console.txt").open("w+", encoding="utf-8") as log:
         viewer = subprocess.Popen([str(exe), "cluster", str(source), *flags], stdin=subprocess.DEVNULL,
                                   stdout=log, stderr=log)
         try:
             wait_for(lambda: "Following the existing" in (root / "console.txt").read_text(encoding="utf-8"),
                      "Visible console did not attach to coordinator")
-            second = command(exe, "cluster", bad, *flags)
-            require(second.returncode == 0 and "existing ltx-klusta console" in second.stderr, second.stderr)
+            # Redirected commands can observe progress without occupying the
+            # visible console lease used by Explorer and interactive terminals.
+            second = subprocess.Popen([str(exe), "cluster", str(bad), *flags], stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+            wait_for(lambda: len(records(queue)) == 2, "Second command did not join the shared queue")
             coordinator.kill()
             coordinator.communicate(timeout=5)
             require(viewer.wait(timeout=60) == 1, "A failed recording must produce a failing console exit code")
+            _, second_log = second.communicate(timeout=60)
+            require(second.returncode == 1 and "Queue finished:" in second_log, second_log)
         finally:
+            if second is not None and second.poll() is None:
+                second.kill()
+                second.communicate()
             if viewer.poll() is None:
                 viewer.kill()
                 viewer.wait()
@@ -124,19 +133,47 @@ def check_terminal(exe, root):
             read()
             return bool(list((queue / "done").glob("*.json")))
         wait_for(complete, "Interactive queue did not complete")
-        def released():
+        def owns_console():
             read()
             with (queue / "console.lock").open("a+b") as lock:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    return True
-                except BlockingIOError:
                     return False
-        wait_for(released, "Completed dashboard did not release its console lease")
-        # The finished dashboard must remain open while a fresh launch obtains
-        # its own console lease. This exercises the idle/submit handoff barrier.
-        second = command(exe, "cluster", source, "--queue-dir", queue)
-        require(second.returncode == 0 and "Queue finished:" in second.stderr, second.stderr)
+                except BlockingIOError:
+                    return True
+        wait_for(owns_console, "Completed dashboard did not retain its console lease")
+        # A later batch must restart processing in this same completed dashboard.
+        later = root / "later λ.2"
+        recording(later, 300)
+        request = root / "selection.json"
+        request.write_text(json.dumps([str(later)]), encoding="utf-8")
+        second = command(exe, "enqueue", "--request", request, "--queue-dir", queue)
+        require(second.returncode == 0 and "Queued 1" in second.stdout, second.stderr)
+        wait_for(lambda: (read(), later.with_suffix(".clu.2").is_file())[1],
+                 "Idle dashboard did not process the later selection")
+        # An interactive second launch must return without creating another UI.
+        other_master, other_slave = pty.openpty()
+        duplicate = subprocess.Popen([str(exe), "resume", "--queue-dir", str(queue)],
+                                     stdin=other_slave, stdout=other_slave, stderr=other_slave)
+        try:
+            require(duplicate.wait(timeout=10) == 0, "Second visible console did not yield to the first")
+            duplicate_output = bytearray()
+            while select.select([other_master], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(other_master, 65536)
+                    if not chunk:
+                        break
+                    duplicate_output.extend(chunk)
+                except OSError:
+                    break
+            require(b"existing ltx-klusta console" in duplicate_output,
+                    f"Second visible console did not report its existing owner: {duplicate_output!r}")
+        finally:
+            if duplicate.poll() is None:
+                duplicate.kill()
+                duplicate.wait()
+            os.close(other_slave)
+            os.close(other_master)
         for _ in range(10):
             read()
         require(process.poll() is None, "Dashboard closed before the user could inspect completion")

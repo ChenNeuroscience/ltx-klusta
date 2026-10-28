@@ -6,6 +6,7 @@ use crate::queue_progress::Progress;
 use crate::{pipeline, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
@@ -252,18 +253,29 @@ impl Queue {
         requested: &[String],
         log: &mut dyn Write,
     ) -> Result<Option<ConsoleResult>> {
-        let visible = self.lock_file("console.lock")?;
-        match visible.try_lock() {
-            Ok(()) => (),
-            Err(TryLockError::WouldBlock) => {
-                writeln!(
-                    log,
-                    "Queued. Progress is shown in the existing ltx-klusta console."
-                )?;
-                return Ok(None);
+        // Redirected commands may follow the coordinator without occupying the
+        // visible console lease. Explorer can still open an actual dashboard.
+        let visible = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+            let file = self.lock_file("console.lock")?;
+            match file.try_lock() {
+                Ok(()) => (),
+                Err(TryLockError::WouldBlock) => {
+                    writeln!(
+                        log,
+                        "Queued. Progress is shown in the existing ltx-klusta console."
+                    )?;
+                    return Ok(None);
+                }
+                Err(TryLockError::Error(error)) => return Err(error.into()),
             }
-            Err(TryLockError::Error(error)) => return Err(error.into()),
-        }
+            Some(file)
+        } else {
+            None
+        };
+        let _session = visible
+            .as_ref()
+            .map(|_| crate::windows_console::Session::register(&self.root))
+            .transpose()?;
         writeln!(
             log,
             "ltx-klusta queue\nKeep this window open while processing.\nLogs: {}",
@@ -282,7 +294,7 @@ impl Queue {
         };
         let mut failed = false;
         let mut following = false;
-        let final_records = loop {
+        loop {
             match self.drain_inner(limit, log, &mut progress, false)? {
                 Some(result) => failed |= result,
                 None if !following => {
@@ -292,19 +304,30 @@ impl Queue {
                 None => (),
             }
             progress.poll(self, log)?;
-            {
+            let finished = {
                 let _guard = self.admission()?;
                 if self.files("pending")?.is_empty() && self.files("running")?.is_empty() {
-                    // Release under admission before the caller waits for Enter.
-                    // A new launch can then start a new visible session.
-                    let snapshot = self.records_unlocked()?;
-                    visible.unlock()?;
-                    break snapshot;
+                    Some(self.records_unlocked()?)
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = finished {
+                if progress.finish(self, snapshot, log)? {
+                    // Close under admission only if no submission arrived while
+                    // the user dismissed the idle dashboard.
+                    let _guard = self.admission()?;
+                    if self.files("pending")?.is_empty() && self.files("running")?.is_empty() {
+                        drop(_session);
+                        if let Some(file) = &visible {
+                            file.unlock()?;
+                        }
+                        break;
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(100));
-        };
-        progress.finish(self, final_records, log)?;
+        }
         Ok(Some(ConsoleResult {
             failed: failed || progress.failed(),
             needs_pause: !progress.interactive(),

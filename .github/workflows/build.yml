@@ -35,6 +35,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
+      - name: Check Windows build environment
+        if: runner.os == 'Windows'
+        run: python tests/check_windows_build.py
       - name: Set up stable Rust and check tools
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
@@ -47,6 +50,9 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
       - name: Package
+        env:
+          LTXK_SIGNING_PFX_BASE64: ${{ secrets.LTXK_SIGNING_PFX_BASE64 }}
+          LTXK_SIGNING_PFX_PASSWORD: ${{ secrets.LTXK_SIGNING_PFX_PASSWORD }}
         run: python scripts/package_rust.py --exe ${{ matrix.executable }} --output dist/ltxk-${{ matrix.platform }} --platform ${{ matrix.package_platform }}
       - name: Test the package (CLI, dumps, features, clustering, queue, console, 1M spikes)
         run: python tests/check_package.py --package dist/ltxk-${{ matrix.platform }}
@@ -85,7 +91,7 @@ jobs:
           tag: ${{ steps.package.outputs.tag }}
           commit: ${{ github.sha }}
           name: ltxk ${{ steps.package.outputs.tag }}
-          body: Built and tested from commit ${{ github.sha }}. Windows - download the windows zip, extract it, and drag recordings onto ltxk.exe. macOS - download the macos zip and move ltx-klusta.app to Applications. See README.md for details.
+          body: Built and tested from commit ${{ github.sha }}. Windows - download the windows zip, extract it, and run Install Explorer integration.cmd to add Run ltxk to the right-click menu. Approve the bundled self-signed certificate when asked. macOS - download the macos zip and move ltx-klusta.app to Applications. See README.md for details.
           artifacts: release/*.zip,release/*.sha256
           artifactErrorsFailBuild: true
           allowUpdates: true

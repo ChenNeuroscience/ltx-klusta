@@ -14,6 +14,7 @@ pub mod pipeline;
 pub mod progress;
 pub mod queue;
 mod queue_progress;
+mod windows_console;
 pub use extract::Features;
 use std::fmt;
 use std::io;

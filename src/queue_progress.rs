@@ -98,10 +98,16 @@ impl Progress {
     }
 
     pub(crate) fn poll(&mut self, queue: &Queue, log: &mut dyn Write) -> Result<()> {
-        self.render(queue, queue.records()?, log)
+        self.render(queue, queue.records()?, log, false).map(|_| ())
     }
 
-    fn render(&mut self, queue: &Queue, snapshot: Vec<Job>, log: &mut dyn Write) -> Result<()> {
+    fn render(
+        &mut self,
+        queue: &Queue,
+        snapshot: Vec<Job>,
+        log: &mut dyn Write,
+        finished: bool,
+    ) -> Result<bool> {
         let jobs: Vec<Job> = snapshot
             .into_iter()
             .filter(|job| !self.ignored.contains(&job.id))
@@ -124,13 +130,12 @@ impl Progress {
                 set_title(&format!("ltx-klusta: {}", counts.description()));
             }
             self.last_counts = Some(counts);
-            dashboard.update(
+            return dashboard.update(
                 &jobs,
                 &format!("{} workers max · {}", self.limit, counts.description()),
                 &queue.root.join("logs"),
-                false,
-            )?;
-            return Ok(());
+                finished,
+            );
         }
         for job in &jobs {
             let next = self.entries.len() + 1;
@@ -207,29 +212,28 @@ impl Progress {
             self.last_counts = Some(counts);
             self.heartbeat = Instant::now();
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) fn finish(
         &mut self,
         queue: &Queue,
-        snapshot: Vec<Job>,
+        mut snapshot: Vec<Job>,
         log: &mut dyn Write,
-    ) -> Result<()> {
-        self.render(queue, snapshot.clone(), log)?;
-        let jobs: Vec<_> = snapshot
-            .into_iter()
-            .filter(|job| !self.ignored.contains(&job.id))
-            .collect();
-        if let Some(dashboard) = &mut self.dashboard {
-            while !dashboard.update(
-                &jobs,
-                &format!("{} workers max · {}", self.limit, self.counts.description()),
-                &queue.root.join("logs"),
-                true,
-            )? {
-                std::thread::sleep(Duration::from_millis(100));
+    ) -> Result<bool> {
+        loop {
+            if snapshot
+                .iter()
+                .any(|job| matches!(job.phase, Phase::Pending | Phase::Running))
+            {
+                return Ok(false);
             }
+            let dismissed = self.render(queue, snapshot, log, true)?;
+            if dismissed || !self.interactive() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            snapshot = queue.records()?;
         }
         writeln!(
             log,
@@ -237,7 +241,7 @@ impl Progress {
             self.counts.description(),
             queue.root.join("logs").display()
         )?;
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn failed(&self) -> bool {
