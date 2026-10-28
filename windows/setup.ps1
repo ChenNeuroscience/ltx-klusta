@@ -41,7 +41,11 @@ function Save-State([string]$ActiveDirectory, [object[]]$ManagedCertificates) {
     try {
         @{ ActiveDirectory = $ActiveDirectory; ManagedCertificates = @($ManagedCertificates | Where-Object { $_ } | Select-Object -Unique) } |
             ConvertTo-Json | Set-Content -LiteralPath $temporary -Encoding UTF8
-        if (Test-Path -LiteralPath $statePath) { [IO.File]::Replace($temporary, $statePath, $null) }
+        if (Test-Path -LiteralPath $statePath) {
+            # PowerShell converts $null to an empty string for this .NET string
+            # argument. File.Replace needs a real null to omit the backup path.
+            [IO.File]::Replace($temporary, $statePath, [NullString]::Value)
+        }
         else { [IO.File]::Move($temporary, $statePath) }
     } finally {
         Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
