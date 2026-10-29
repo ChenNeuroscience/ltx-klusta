@@ -7,6 +7,7 @@ foreach ($path in @((Join-Path $PackageDirectory 'setup.ps1'),
     [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors) | Out-Null
     if ($errors.Count) { throw ($errors | Out-String) }
 }
+& (Join-Path $PSScriptRoot 'check_windows_state.ps1') -SetupPath (Join-Path $PackageDirectory 'setup.ps1')
 $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new((Join-Path $PackageDirectory 'ltxk.cer'))
 if ($cert.HasPrivateKey -or $cert.Subject -ne 'CN=ChenNeuroscience ltxk') { throw 'Unexpected public signing certificate.' }
 foreach ($name in @('ltxk.exe', 'ltxk-launch.exe', 'ltxk-shell.dll', 'ltxk.msix')) {
