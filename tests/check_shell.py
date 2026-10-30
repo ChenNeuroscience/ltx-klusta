@@ -78,7 +78,9 @@ def check_shell(exe):
         bad_record = queue / "pending" / "unreadable.json"
         bad_record.write_text("{broken json", encoding="utf-8")
         result = submit([str(added)])
-        require(result.returncode != 0 and str(bad_record) in result.stderr, result.stderr)
+        # Queue::open canonicalizes its root, expanding Windows short names
+        # such as RUNNER~1 as well as resolving symlinks on other platforms.
+        require(result.returncode != 0 and str(bad_record.resolve()) in result.stderr, result.stderr)
         bad_record.unlink()
         request.write_text('{broken json', encoding="utf-8")
         result = command(exe, "enqueue", "--request", request, "--queue-dir", queue)
