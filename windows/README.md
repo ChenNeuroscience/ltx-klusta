@@ -59,6 +59,13 @@ queue admission lock. The helper removes its request on completion or failure;
 submission errors are shown in a dialog and `%LOCALAPPDATA%\ltxk\queue\launcher.log`.
 Neither selected paths nor install paths are evaluated by a command shell.
 
+The package explicitly disables AppData file-write virtualization alongside
+the `unvirtualizedResources` capability. The packaged COM host and the portable
+Rust executable must see the same selection files and queue. Permission to use
+unvirtualized resources alone does not disable file redirection; a request
+written into a private package location can otherwise be invisible to the
+process reading it. See Microsoft's [AppData virtualization settings](https://learn.microsoft.com/en-us/windows/msix/desktop/flexible-virtualization).
+
 The helper serializes concurrent launches using `desktop-launch.lock`. It
 checks the visible console's OS lease and verifies its PID plus process creation
 time before attaching briefly to locate the actual host window. It restores
@@ -86,6 +93,10 @@ C++ runtime, matching the Rust build's static runtime. Packaging builds and runs
 the COM/selection/quoting smoke test, creates the sparse MSIX package, and signs
 the executables, DLL, and MSIX with `scripts/sign_windows.ps1`. Only the public
 `ltxk.cer` is distributed. Native build intermediates and private keys are excluded.
+
+The Rust build script embeds `assets/ltxk.ico` in `ltxk.exe`; packaging embeds
+the same icon in the GUI helper and copies the exported MSIX logos. The source
+tree keeps the SVG, platform exports and regeneration instructions in `assets/`.
 
 By default CI creates a fresh self-signed certificate for each build. This
 needs no configuration, but every new release requires a new trust approval.

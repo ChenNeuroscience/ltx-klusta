@@ -66,7 +66,13 @@ impl Settings {
         let explicit = path.is_some();
         let path = match path {
             Some(path) => path.to_owned(),
-            None => std::env::current_exe()?.with_file_name("ltxk.json"),
+            None => std::env::current_exe()
+                .map_err(|error| {
+                    Error::Message(format!(
+                        "Cannot locate the executable for settings: {error}"
+                    ))
+                })?
+                .with_file_name("ltxk.json"),
         };
         if !path.exists() && !path.is_symlink() {
             if explicit {
@@ -77,9 +83,13 @@ impl Settings {
             }
             return Ok(Self::default());
         }
-        let mut settings: Self = serde_json::from_reader(File::open(&path)?)
-            .map_err(|error| Error::Message(format!("Invalid configuration: {error}")))?;
-        settings.resolve_paths(fs::canonicalize(path)?.parent().unwrap());
+        let file = File::open(&path)
+            .map_err(|error| Error::at_path("Cannot open configuration", &path, error))?;
+        let mut settings: Self = serde_json::from_reader(file)
+            .map_err(|error| Error::at_path("Invalid configuration", &path, error))?;
+        let resolved = fs::canonicalize(&path)
+            .map_err(|error| Error::at_path("Cannot resolve configuration", &path, error))?;
+        settings.resolve_paths(resolved.parent().unwrap());
         Ok(settings)
     }
 

@@ -1,4 +1,4 @@
-//! Spike sorting for tetrode recordings: PCA feature extraction followed by a
+//! Spike clustering for tetrode recordings: PCA feature extraction followed by a
 //! Rust port of KlustaKwik's classification-EM clustering.
 
 #[cfg(not(target_pointer_width = "64"))]
@@ -33,6 +33,12 @@ pub enum Error {
     Io(io::Error),
     Invalid(&'static str),
     Message(String),
+}
+impl Error {
+    /// Keep the failed operation and path alongside the underlying error.
+    pub fn at_path(action: &str, path: &std::path::Path, error: impl fmt::Display) -> Self {
+        Self::Message(format!("{action} \"{}\": {error}", path.display()))
+    }
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -9,8 +9,8 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Spike sorting for tetrode recordings: PCA features, then clustering with a
-/// Rust port of KlustaKwik. Writes NAME.clu.N beside each NAME.N recording.
+/// Cluster spikes in tetrode recordings using PCA features and a Rust port
+/// of KlustaKwik. Writes NAME.clu.N beside each NAME.N recording.
 #[derive(Debug, Parser)]
 #[command(
     name = "ltx-klusta",
@@ -320,8 +320,12 @@ fn run(cli: Cli) -> Result<Exit> {
     }
     match cli.command {
         Some(Command::Enqueue { request, queue_dir }) => {
-            let inputs: Vec<PathBuf> = serde_json::from_reader(std::fs::File::open(request)?)
-                .map_err(|error| Error::Message(format!("Explorer selection: {error}")))?;
+            let file = std::fs::File::open(&request).map_err(|error| {
+                Error::at_path("Cannot open Explorer selection", &request, error)
+            })?;
+            let inputs: Vec<PathBuf> = serde_json::from_reader(file).map_err(|error| {
+                Error::at_path("Cannot read Explorer selection", &request, error)
+            })?;
             if inputs.is_empty() {
                 return Err(Error::Invalid("Select at least one recording"));
             }

@@ -44,6 +44,8 @@ def create(executable, output):
         script.write_text(SCRIPT, encoding="utf-8")
         subprocess.run(["/usr/bin/osacompile", "-o", str(output), str(script)], check=True)
     shutil.copy2(executable, output / "Contents" / "Resources" / "ltxk")
+    shutil.copy2(Path(__file__).resolve().parent.parent / "assets/ltxk.icns",
+                 output / "Contents" / "Resources" / "ltxk.icns")
     info = output / "Contents" / "Info.plist"
     with info.open("rb") as stream:
         metadata = plistlib.load(stream)
@@ -51,6 +53,7 @@ def create(executable, output):
         "CFBundleIdentifier": "org.chenneuroscience.ltxk",
         "CFBundleName": "ltx-klusta",
         "CFBundleDisplayName": "ltx-klusta",
+        "CFBundleIconFile": "ltxk.icns",
         "NSAppleEventsUsageDescription": "Show clustering progress in Terminal.",
         "CFBundleDocumentTypes": [{"CFBundleTypeName": "Tetrode recordings", "CFBundleTypeRole": "Viewer",
                                    "CFBundleTypeExtensions": ["*"], "LSHandlerRank": "None"}],

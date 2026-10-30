@@ -101,9 +101,11 @@ void submit(const std::wstring& exe, const std::wstring& request, const std::wst
     SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
     Handle log(CreateFileW(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                           &attributes, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    // Check each call before another Win32 API can overwrite its error code.
+    check(log.valid(), (L"Cannot create the launcher log:\n" + log_path).c_str());
     Handle input(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                             &attributes, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    check(log.valid() && input.valid(), L"Cannot open the launcher log.");
+    check(input.valid(), L"Cannot open NUL for queue submission input.");
     auto args = quote(exe) + L" enqueue --request " + quote(request);
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);

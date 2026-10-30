@@ -1,7 +1,9 @@
+<img src="assets/ltxk.svg" width="96" height="96" alt="Three blue, green and red clusters separated by dividing lines">
+
 # ltx-klusta
 
-ltx-klusta sorts the spikes in tetrode recordings into clusters, ready to
-review in your usual cluster-cutting software. Give it a recording such as
+ltx-klusta clusters the spikes in tetrode recordings for review in your usual
+cluster-cutting software. Give it a recording such as
 `session.1` and it writes `session.clu.1` next to it.
 
 It runs on Windows and on Apple Silicon Macs. There is nothing else to install.

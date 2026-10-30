@@ -15,6 +15,31 @@ foreach ($name in @('ltxk.exe', 'ltxk-launch.exe', 'ltxk-shell.dll', 'ltxk.msix'
     if (-not $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint -ne $cert.Thumbprint -or
         $signature.Status -eq 'HashMismatch') { throw "Incorrect signature on $name." }
 }
+# Verify the shipped executables expose the custom icon, rather than silently
+# falling back to Windows' generic application icon when linking resources.
+Add-Type -AssemblyName System.Drawing
+foreach ($name in @('ltxk.exe', 'ltxk-launch.exe')) {
+    $icon = [Drawing.Icon]::ExtractAssociatedIcon((Join-Path $PackageDirectory $name))
+    if (-not $icon) { throw "Missing application icon in $name." }
+    $bitmap = $null
+    try {
+        $bitmap = $icon.ToBitmap()
+        $red = $false; $green = $false; $blue = $false
+        for ($y = 0; $y -lt $bitmap.Height; $y++) {
+            for ($x = 0; $x -lt $bitmap.Width; $x++) {
+                $pixel = $bitmap.GetPixel($x, $y)
+                if ($pixel.A -lt 128) { continue }
+                if ($pixel.R -gt $pixel.G + 40 -and $pixel.R -gt $pixel.B + 40) { $red = $true }
+                if ($pixel.G -gt $pixel.R + 40 -and $pixel.G -gt $pixel.B + 40) { $green = $true }
+                if ($pixel.B -gt $pixel.R + 40 -and $pixel.B -gt $pixel.G + 40) { $blue = $true }
+            }
+        }
+        if (-not ($red -and $green -and $blue)) { throw "The cluster icon is missing from $name." }
+    } finally {
+        if ($bitmap) { $bitmap.Dispose() }
+        $icon.Dispose()
+    }
+}
 # Windows PowerShell 5.1 ignores -Include with -LiteralPath. Filter the
 # enumerated files explicitly so ordinary package files are not false positives.
 if (Get-ChildItem -LiteralPath $PackageDirectory -Recurse -File |
@@ -38,9 +63,20 @@ if ($manifest.Package.Identity.Publisher -ne $cert.Subject -or $manifest.Package
 $ns = [Xml.XmlNamespaceManager]::new($manifest.NameTable)
 $ns.AddNamespace('uap10', 'http://schemas.microsoft.com/appx/manifest/uap/windows10/10')
 $ns.AddNamespace('desktop5', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10/5')
+$ns.AddNamespace('desktop6', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10/6')
+$ns.AddNamespace('rescap', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities')
 if ($manifest.SelectSingleNode('//uap10:AllowExternalContent', $ns).InnerText -ne 'true' -or
     $manifest.SelectSingleNode('//desktop5:Verb', $ns).Clsid -ne 'B0EA0498-10EE-49F3-A631-3613B698965C') {
     throw 'Missing sparse identity or Explorer command registration.'
+}
+# Check both copies: sharing permission alone does not disable AppData writes
+# being redirected into a private location invisible to the unpackaged CLI.
+foreach ($document in @($manifest, $external)) {
+    $policy = $document.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Properties"]/desktop6:FileSystemWriteVirtualization', $ns)
+    if (-not $policy -or $policy.InnerText -ne 'disabled' -or
+        -not $document.SelectSingleNode('//rescap:Capability[@Name="unvirtualizedResources"]', $ns)) {
+        throw 'The Explorer package must disable AppData file virtualization so selection files and the queue are shared with ltxk.exe.'
+    }
 }
 $embedded = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $PackageDirectory 'ltxk-launch.exe')))
 foreach ($text in @('urn:schemas-microsoft-com:msix.v1', 'ChenNeuroscience.ltxk', 'CN=ChenNeuroscience ltxk')) {
