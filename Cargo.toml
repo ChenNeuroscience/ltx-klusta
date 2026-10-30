@@ -21,6 +21,9 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 crossterm = "0.29"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+[build-dependencies]
+embed-resource = "3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -92,34 +92,51 @@ impl Queue {
     }
 
     pub fn open(root: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&root)
+            .map_err(|error| Error::at_path("Cannot create queue folder", &root, error))?;
         for name in [
             "pending", "running", "done", "failed", "logs", "work", "progress",
         ] {
-            fs::create_dir_all(root.join(name))?;
+            let path = root.join(name);
+            fs::create_dir_all(&path)
+                .map_err(|error| Error::at_path("Cannot create queue folder", &path, error))?;
         }
         Ok(Self {
-            root: fs::canonicalize(root)?,
+            root: fs::canonicalize(&root)
+                .map_err(|error| Error::at_path("Cannot resolve queue folder", &root, error))?,
         })
     }
 
     fn lock_file(&self, name: &str) -> Result<File> {
-        Ok(OpenOptions::new()
+        let path = self.root.join(name);
+        OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.root.join(name))?)
+            .open(&path)
+            .map_err(|error| Error::at_path("Cannot open queue lock", &path, error))
     }
     fn admission(&self) -> Result<File> {
         let file = self.lock_file("admission.lock")?;
-        file.lock()?;
+        file.lock().map_err(|error| {
+            Error::at_path(
+                "Cannot lock queue",
+                &self.root.join("admission.lock"),
+                error,
+            )
+        })?;
         Ok(file)
     }
     fn files(&self, phase: &str) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
-        for entry in fs::read_dir(self.root.join(phase))? {
-            let path = entry?.path();
+        let directory = self.root.join(phase);
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| Error::at_path("Cannot list queue folder", &directory, error))?
+        {
+            let path = entry
+                .map_err(|error| Error::at_path("Cannot read queue entry in", &directory, error))?
+                .path();
             if path.extension().is_some_and(|ext| ext == "json") {
                 files.push(path);
             }
@@ -128,14 +145,17 @@ impl Queue {
         Ok(files)
     }
     fn read(path: &Path) -> Result<Job> {
-        let mut record: serde_json::Value =
-            serde_json::from_reader(File::open(path)?).map_err(json_error)?;
+        let file = File::open(path)
+            .map_err(|error| Error::at_path("Cannot open queue record", path, error))?;
+        let mut record: serde_json::Value = serde_json::from_reader(file)
+            .map_err(|error| Error::at_path("Cannot read queue record", path, error))?;
         // Records written by other versions may hold settings this one lacks.
         let known = serde_json::to_value(pipeline::Settings::default()).map_err(json_error)?;
         if let Some(settings) = record.get_mut("settings").and_then(|s| s.as_object_mut()) {
             settings.retain(|key, _| known.get(key).is_some());
         }
-        let mut job: Job = serde_json::from_value(record).map_err(json_error)?;
+        let mut job: Job = serde_json::from_value(record)
+            .map_err(|error| Error::at_path("Cannot read queue record", path, error))?;
         // Progress is advisory and written atomically by this job's worker.
         job.progress = None;
         if let Some(started) = job.started_ms {
@@ -163,9 +183,13 @@ impl Queue {
         settings.validate()?;
         let mut paths = Vec::new();
         for input in inputs {
-            let path = fs::canonicalize(input)?;
+            let path = fs::canonicalize(input)
+                .map_err(|error| Error::at_path("Cannot resolve recording", input, error))?;
             pipeline::output_path(&path)?;
-            if !path.is_file() {
+            if !fs::metadata(&path)
+                .map_err(|error| Error::at_path("Cannot read recording", &path, error))?
+                .is_file()
+            {
                 return Err(Error::Invalid("Queue input must be a recording file"));
             }
             paths.push(path);
@@ -178,6 +202,7 @@ impl Queue {
             }
         }
         let mut ids = Vec::new();
+        let pending = self.root.join("pending");
         for input in paths {
             if let Some(job) = active.iter().find(|job| job.input == input) {
                 ids.push(job.id.clone());
@@ -186,7 +211,10 @@ impl Queue {
             let mut temporary = tempfile::Builder::new()
                 .prefix(&format!("{}-", now()))
                 .suffix(".json")
-                .tempfile_in(self.root.join("pending"))?;
+                .tempfile_in(&pending)
+                .map_err(|error| {
+                    Error::at_path("Cannot create queue record in", &pending, error)
+                })?;
             let id = temporary
                 .path()
                 .file_stem()
@@ -206,9 +234,15 @@ impl Queue {
                 output: None,
                 error: None,
             };
-            serde_json::to_writer_pretty(&mut temporary, &job).map_err(json_error)?;
-            temporary.as_file().sync_all()?;
-            temporary.keep().map_err(|error| Error::Io(error.error))?;
+            serde_json::to_writer_pretty(&mut temporary, &job).map_err(|error| {
+                Error::at_path("Cannot write queue record", temporary.path(), error)
+            })?;
+            temporary.as_file().sync_all().map_err(|error| {
+                Error::at_path("Cannot sync queue record", temporary.path(), error)
+            })?;
+            temporary.keep().map_err(|error| {
+                Error::at_path("Cannot keep queue record in", &pending, error.error)
+            })?;
             active.push(job);
             ids.push(id);
         }

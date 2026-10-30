@@ -16,6 +16,8 @@ def package(exe, output, platform):
     shutil.copy2(exe, output / ("ltxk.exe" if platform == "windows" else "ltxk"))
     for name in ("README.md", "CLUSTERING.md", "ltxk.example.json"):
         shutil.copy2(name, output / name)
+    (output / "assets").mkdir()
+    shutil.copy2("assets/ltxk.svg", output / "assets/ltxk.svg")
     (output / "windows").mkdir()
     shutil.copy2("windows/README.md", output / "windows/README.md")
     if platform == "macos":

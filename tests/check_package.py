@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import plistlib
 import struct
 import subprocess
 import sys
@@ -45,6 +46,7 @@ def imports(exe):
 
 def check(package):
     executable = package / ("ltxk.exe" if os.name == "nt" else "ltxk")
+    require((package / "assets/ltxk.svg").is_file(), "The README icon is missing from the package")
     for line in (package / "SHA256SUMS.txt").read_text().splitlines():
         expected, name = line.split("  ", 1)
         require(hashlib.sha256((package / name).read_bytes()).hexdigest() == expected, f"Checksum mismatch: {name}")
@@ -63,6 +65,10 @@ def check(package):
         app = package / "ltx-klusta.app"
         require((app / "Contents" / "Resources" / "ltxk").read_bytes() == executable.read_bytes(),
                 "The app does not contain the packaged executable")
+        with (app / "Contents/Info.plist").open("rb") as stream:
+            metadata = plistlib.load(stream)
+        require(metadata.get("CFBundleIconFile") == "ltxk.icns" and
+                (app / "Contents/Resources/ltxk.icns").is_file(), "The app icon is missing")
         subprocess.run(["/usr/bin/codesign", "--verify", "--strict", "--deep", str(app)], check=True)
     with tempfile.TemporaryDirectory(prefix="ltxk isolated package ") as temporary:
         previous = Path.cwd()

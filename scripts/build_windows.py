@@ -6,10 +6,8 @@ import datetime
 import os
 from pathlib import Path
 import shutil
-import struct
 import subprocess
 import tempfile
-import zlib
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,33 +38,14 @@ def msvc_environment():
     return batch_environment(Path(install) / "Common7/Tools/VsDevCmd.bat")
 
 
-def logo(size):
-    """A small code-drawn L mark, encoded as PNG without imaging dependencies."""
-    rows = bytearray()
-    for y in range(size):
-        rows.append(0)
-        for x in range(size):
-            white = ((size * 3 // 10 <= x < size * 4 // 10 and size // 4 <= y < size * 3 // 4)
-                     or (size * 3 // 10 <= x < size * 7 // 10 and size * 13 // 20 <= y < size * 3 // 4))
-            rows.extend((255, 255, 255, 255) if white else (34, 77, 108, 255))
-    def chunk(kind, data):
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(bytes(rows))) + chunk(b"IEND", b""))
-
-
 def build(output):
     environment = msvc_environment()
     output = output.resolve()
-    assets = output / "Assets"
-    assets.mkdir()
-    for name, size in (("StoreLogo", 50), ("Square44x44Logo", 44), ("Square150x150Logo", 150)):
-        (assets / f"{name}.png").write_bytes(logo(size))
+    assets = output / "assets"
+    shutil.copytree(ROOT / "assets/windows", assets, dirs_exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ltxk-shell-build-") as temporary:
         work = Path(temporary)
-        image = logo(64)
-        (work / "ltxk.ico").write_bytes(struct.pack("<HHH", 0, 1, 1)
-                                      + struct.pack("<BBBBHHII", 64, 64, 0, 0, 1, 32, len(image), 22) + image)
+        shutil.copy2(ROOT / "assets/ltxk.ico", work / "ltxk.ico")
         (work / "icon.rc").write_text(f'#pragma code_page(65001)\n1 ICON "{(work / "ltxk.ico").as_posix()}"\n', encoding="utf-8")
         def run(args):
             # On Windows CreateProcess searches the parent's PATH, not the PATH
