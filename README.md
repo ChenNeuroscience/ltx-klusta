@@ -2,9 +2,10 @@
 
 # ltx-klusta
 
-ltx-klusta clusters the spikes in tetrode recordings for review in your usual
-cluster-cutting software. Give it a recording such as
-`session.1` and it writes `session.clu.1` next to it.
+The core of ltx-klusta is  derived from [klustakwik](https://github.com/klusta-team/klustakwik), but rewritten in Rust and optimised for a more "opinionated" use case.
+It also does a bit more than klustakwik does - performing PCA on the input files and managing a queue of files to be clustered. Plus it comes with a handy integration for the Windows right-click file menu.
+
+It operates on LTX tetrode files (`*.1`, `*.2`, ...), and it outputs '*.clu.1`, `*.clu.2`.
 
 It runs on Windows and on Apple Silicon Macs. There is nothing else to install.
 
